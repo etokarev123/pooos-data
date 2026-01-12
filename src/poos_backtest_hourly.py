@@ -1,12 +1,12 @@
 import os
 import io
 import json
-import math
 import pandas as pd
 import numpy as np
 import boto3
 from botocore.config import Config
 from dotenv import load_dotenv
+
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -19,31 +19,37 @@ R2_KEY = os.environ["R2_ACCESS_KEY_ID"]
 R2_SECRET = os.environ["R2_SECRET_ACCESS_KEY"]
 R2_BUCKET = os.environ["R2_BUCKET"]
 
-# -------------- ENV (Strategy) ------------
-# "Rocket"/impulse on hourly bars:
-LOOKBACK_BARS = int(os.getenv("LOOKBACK_BARS", "35"))          # ~5 trading days if ~7 bars/day
-IMPULSE_MIN_RET = float(os.getenv("IMPULSE_MIN_RET", "0.30"))  # 30%
-VOL_MA_BARS = int(os.getenv("VOL_MA_BARS", "140"))             # ~20 trading days * 7 bars
-VOL_MULT = float(os.getenv("VOL_MULT", "2.0"))
+# -------------- ENV (Intraday POOS-style) ------------
+# Intraday impulse: smaller and faster than daily POOS
+LOOKBACK_BARS = int(os.getenv("LOOKBACK_BARS", "20"))           # ~3 trading days
+IMPULSE_MIN_RET = float(os.getenv("IMPULSE_MIN_RET", "0.08"))   # 8% impulse
+VOL_MA_BARS = int(os.getenv("VOL_MA_BARS", "60"))               # ~8-9 trading days
+VOL_MULT = float(os.getenv("VOL_MULT", "1.3"))                  # 1.3x volume
 
-# Trend filter
+# Trend filter (lighter): close above EMA20 and EMA50, EMA20 > EMA50
 USE_TREND_FILTER = os.getenv("USE_TREND_FILTER", "1") == "1"
 
-# Entry/exit
+# Entry: pullback touch EMA20 (default). You can switch to EMA10 by env ENTRY_EMA=10
+ENTRY_EMA = int(os.getenv("ENTRY_EMA", "20"))
+
+# Exits
 ATR_PERIOD = int(os.getenv("ATR_PERIOD", "14"))
 STOP_ATR = float(os.getenv("STOP_ATR", "1.0"))
 TP_ATR = float(os.getenv("TP_ATR", "1.5"))
-MOVE_BE_PCT = float(os.getenv("MOVE_BE_PCT", "0.01"))          # +1% -> BE
-MAX_HOLD_BARS = int(os.getenv("MAX_HOLD_BARS", "300"))         # ~40 trading days
-COOLOFF_BARS = int(os.getenv("COOLOFF_BARS", "140"))           # ~20 days
+MOVE_BE_PCT = float(os.getenv("MOVE_BE_PCT", "0.01"))           # +1% => move stop to BE
 
-# Portfolio approximation (trade-by-trade compounding)
-RISK_PER_TRADE = float(os.getenv("RISK_PER_TRADE", "0.01"))    # 1% equity per trade
+# Trade management
+MAX_HOLD_BARS = int(os.getenv("MAX_HOLD_BARS", "120"))           # ~2-3 trading weeks
+COOLOFF_BARS = int(os.getenv("COOLOFF_BARS", "40"))              # ~1 trading week
 
-# Optional: only backtest last N days of hourly bars (for speed). 0 = all.
+# Equity compounding (still simplified)
+RISK_PER_TRADE = float(os.getenv("RISK_PER_TRADE", "0.01"))
+
+# Speed: optionally use only last N bars
 TAIL_BARS = int(os.getenv("TAIL_BARS", "0"))
 
-RESULT_PREFIX = os.getenv("RESULT_PREFIX", "results/poos_hourly")
+# Store results here (new folder so you don't overwrite the previous "No trades")
+RESULT_PREFIX = os.getenv("RESULT_PREFIX", "results/poos_hourly_v2")
 
 # ---------------- R2 client ----------------
 s3 = boto3.client(
@@ -66,8 +72,7 @@ def list_parquet_tickers(prefix="yahoo/1h/"):
         for obj in resp.get("Contents", []):
             key = obj["Key"]
             if key.endswith(".parquet"):
-                t = key.split("/")[-1].replace(".parquet", "")
-                tickers.append(t)
+                tickers.append(key.split("/")[-1].replace(".parquet", ""))
         if resp.get("IsTruncated"):
             token = resp.get("NextContinuationToken")
         else:
@@ -76,8 +81,7 @@ def list_parquet_tickers(prefix="yahoo/1h/"):
 
 def read_parquet_from_r2(key: str) -> pd.DataFrame:
     obj = s3.get_object(Bucket=R2_BUCKET, Key=key)
-    body = obj["Body"].read()
-    return pd.read_parquet(io.BytesIO(body))
+    return pd.read_parquet(io.BytesIO(obj["Body"].read()))
 
 def put_bytes(key: str, data: bytes, content_type="application/octet-stream"):
     s3.put_object(Bucket=R2_BUCKET, Key=key, Body=data, ContentType=content_type)
@@ -90,52 +94,50 @@ def ema(series: pd.Series, span: int) -> pd.Series:
 
 def atr(df: pd.DataFrame, period: int) -> pd.Series:
     prev_close = df["close"].shift(1)
-    tr = pd.concat([
-        (df["high"] - df["low"]).abs(),
-        (df["high"] - prev_close).abs(),
-        (df["low"] - prev_close).abs(),
-    ], axis=1).max(axis=1)
+    tr = pd.concat(
+        [
+            (df["high"] - df["low"]).abs(),
+            (df["high"] - prev_close).abs(),
+            (df["low"] - prev_close).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
     return tr.rolling(period, min_periods=period).mean()
 
-def backtest_one(df: pd.DataFrame, ticker: str):
-    # Expect columns: date, open, high, low, close, volume
-    df = df.sort_values("date").dropna(subset=["open","high","low","close","volume"]).copy()
+def backtest_one(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
+    df = df.sort_values("date").dropna(subset=["open", "high", "low", "close", "volume"]).copy()
+    if "date" in df.columns:
+        df["date"] = pd.to_datetime(df["date"], utc=True)
+
     if TAIL_BARS > 0 and len(df) > TAIL_BARS:
         df = df.iloc[-TAIL_BARS:].copy()
 
-    # indicators
-    df["ema10"]  = ema(df["close"], 10)
-    df["ema20"]  = ema(df["close"], 20)
-    df["ema50"]  = ema(df["close"], 50)
-    df["ema100"] = ema(df["close"], 100)
-    df["ema200"] = ema(df["close"], 200)
-    df["atr"]    = atr(df, ATR_PERIOD)
+    # Indicators
+    df["ema10"] = ema(df["close"], 10)
+    df["ema20"] = ema(df["close"], 20)
+    df["ema50"] = ema(df["close"], 50)
+    df["atr"] = atr(df, ATR_PERIOD)
     df["vol_ma"] = df["volume"].rolling(VOL_MA_BARS, min_periods=VOL_MA_BARS).mean()
 
+    # Impulse
     df["imp_ret"] = df["close"] / df["close"].shift(LOOKBACK_BARS) - 1.0
     df["imp_vol_ok"] = df["volume"] > (VOL_MULT * df["vol_ma"])
 
     if USE_TREND_FILTER:
-        df["trend_ok"] = (
-            (df["close"] > df["ema10"]) &
-            (df["close"] > df["ema20"]) &
-            (df["close"] > df["ema50"]) &
-            (df["close"] > df["ema100"]) &
-            (df["close"] > df["ema200"])
-        )
+        df["trend_ok"] = (df["close"] > df["ema20"]) & (df["close"] > df["ema50"]) & (df["ema20"] > df["ema50"])
     else:
         df["trend_ok"] = True
 
     df["is_impulse"] = (df["imp_ret"] >= IMPULSE_MIN_RET) & df["imp_vol_ok"] & df["trend_ok"]
 
+    # Entry EMA choice
+    ema_col = "ema20" if ENTRY_EMA == 20 else "ema10"
+
     in_pos = False
     watch = False
     cooldown_until = -1
 
-    entry = None
-    stop = None
-    tp = None
-    initial_stop = None
+    entry = stop = tp = initial_stop = None
     be_moved = False
     hold = 0
     entry_time = None
@@ -153,7 +155,7 @@ def backtest_one(df: pd.DataFrame, ticker: str):
             hold += 1
             lo, hi = float(row["low"]), float(row["high"])
 
-            # move to BE on +1%
+            # Move to break-even
             if (not be_moved) and hi >= entry * (1.0 + MOVE_BE_PCT):
                 stop = entry
                 be_moved = True
@@ -161,7 +163,7 @@ def backtest_one(df: pd.DataFrame, ticker: str):
             exit_reason = None
             exit_px = None
 
-            # conservative: stop first if both happen same bar
+            # conservative: stop first if both touched
             if lo <= stop:
                 exit_reason = "STOP"
                 exit_px = stop
@@ -169,9 +171,9 @@ def backtest_one(df: pd.DataFrame, ticker: str):
                 exit_reason = "TP"
                 exit_px = tp
 
-            if exit_reason is not None:
+            if exit_reason:
                 risk_per_share = entry - initial_stop
-                r_mult = (exit_px - entry) / risk_per_share if risk_per_share and risk_per_share > 0 else 0.0
+                r_mult = (exit_px - entry) / risk_per_share if (risk_per_share and risk_per_share > 0) else 0.0
                 trades.append({
                     "ticker": ticker,
                     "entry_time": entry_time,
@@ -184,9 +186,9 @@ def backtest_one(df: pd.DataFrame, ticker: str):
                     "r_mult": float(r_mult),
                     "be_moved": bool(be_moved),
                     "hold_bars": int(hold),
+                    "entry_ema": ema_col,
                 })
 
-                # reset
                 in_pos = False
                 watch = False
                 cooldown_until = i + COOLOFF_BARS
@@ -199,7 +201,7 @@ def backtest_one(df: pd.DataFrame, ticker: str):
             if hold >= MAX_HOLD_BARS:
                 exit_px = float(row["close"])
                 risk_per_share = entry - initial_stop
-                r_mult = (exit_px - entry) / risk_per_share if risk_per_share and risk_per_share > 0 else 0.0
+                r_mult = (exit_px - entry) / risk_per_share if (risk_per_share and risk_per_share > 0) else 0.0
                 trades.append({
                     "ticker": ticker,
                     "entry_time": entry_time,
@@ -212,6 +214,7 @@ def backtest_one(df: pd.DataFrame, ticker: str):
                     "r_mult": float(r_mult),
                     "be_moved": bool(be_moved),
                     "hold_bars": int(hold),
+                    "entry_ema": ema_col,
                 })
 
                 in_pos = False
@@ -223,25 +226,25 @@ def backtest_one(df: pd.DataFrame, ticker: str):
                 entry_time = None
                 continue
 
-        # not in position
+        # Not in position
         if not in_pos:
             if not watch:
                 if bool(row["is_impulse"]):
                     watch = True
             else:
-                # if trend breaks, stop watching
-                if not bool(row["trend_ok"]):
+                # If trend breaks badly, drop watch
+                if USE_TREND_FILTER and (not bool(row["trend_ok"])):
                     watch = False
                     continue
 
-                ema20 = row["ema20"]
                 a = row["atr"]
-                if pd.isna(ema20) or pd.isna(a):
+                e = row[ema_col]
+                if pd.isna(a) or pd.isna(e):
                     continue
 
-                # first touch criterion (hourly): low <= ema20
-                if float(row["low"]) <= float(ema20):
-                    entry = float(ema20)
+                # Pullback "touch" entry: low <= entry_ema
+                if float(row["low"]) <= float(e):
+                    entry = float(e)
                     entry_time = t
                     initial_stop = entry - STOP_ATR * float(a)
                     stop = initial_stop
@@ -266,9 +269,6 @@ def main():
             df = read_parquet_from_r2(key)
             if df is None or df.empty:
                 continue
-            # normalize date type
-            if "date" in df.columns:
-                df["date"] = pd.to_datetime(df["date"], utc=True)
             tr = backtest_one(df, t)
             if not tr.empty:
                 all_trades.append(tr)
@@ -280,7 +280,7 @@ def main():
     trades = pd.concat(all_trades, ignore_index=True) if all_trades else pd.DataFrame()
     print("Trades:", len(trades))
 
-    # Portfolio approximation: compound trade results in exit-time order
+    # Equity (simple trade-by-trade compound)
     equity = 1.0
     curve = []
     if not trades.empty:
@@ -293,7 +293,9 @@ def main():
             curve.append((r["exit_time"], equity))
 
     equity_df = pd.DataFrame(curve, columns=["time", "equity"])
+
     stats = {
+        "mode": "POOS-style intraday (1h)",
         "tickers_tested": int(len(tickers)),
         "trades": int(len(trades)) if not trades.empty else 0,
         "win_rate": float((trades["r_mult"] > 0).mean()) if not trades.empty else 0.0,
@@ -304,34 +306,33 @@ def main():
         "lookback_bars": int(LOOKBACK_BARS),
         "impulse_min_ret": float(IMPULSE_MIN_RET),
         "vol_mult": float(VOL_MULT),
+        "vol_ma_bars": int(VOL_MA_BARS),
         "atr_period": int(ATR_PERIOD),
         "stop_atr": float(STOP_ATR),
         "tp_atr": float(TP_ATR),
         "move_be_pct": float(MOVE_BE_PCT),
+        "entry_ema": int(ENTRY_EMA),
+        "trend_filter": bool(USE_TREND_FILTER),
     }
 
-    # Save artifacts to R2
-    # trades.csv
+    # Save outputs to R2
     if not trades.empty:
         put_text(f"{RESULT_PREFIX}/trades.csv", trades.to_csv(index=False))
     else:
-        put_text(f"{RESULT_PREFIX}/trades.csv", "ticker,entry_time,exit_time,entry,exit,stop_init,tp,exit_reason,r_mult,be_moved,hold_bars\n")
+        put_text(f"{RESULT_PREFIX}/trades.csv", "ticker,entry_time,exit_time,entry,exit,stop_init,tp,exit_reason,r_mult,be_moved,hold_bars,entry_ema\n")
 
-    # equity.csv
     if not equity_df.empty:
         put_text(f"{RESULT_PREFIX}/equity.csv", equity_df.to_csv(index=False))
     else:
         put_text(f"{RESULT_PREFIX}/equity.csv", "time,equity\n")
 
-    # stats.json
     put_text(f"{RESULT_PREFIX}/stats.json", json.dumps(stats, indent=2))
 
-    # equity.png
     plt.figure()
     if not equity_df.empty:
         plt.plot(equity_df["time"], equity_df["equity"])
         plt.xticks(rotation=30, ha="right")
-        plt.title("POOS Hourly (trade-compounded) Equity")
+        plt.title("POOS-style Intraday (1h) Equity (trade-compounded)")
         plt.tight_layout()
     else:
         plt.text(0.5, 0.5, "No trades", ha="center", va="center")
