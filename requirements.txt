@@ -1,8 +1,6 @@
 pandas
 pyarrow
-yfinance
 boto3
 python-dotenv
-tqdm
 numpy
 matplotlib
