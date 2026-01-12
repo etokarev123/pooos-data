@@ -40,15 +40,19 @@ TAIL_BARS = int(os.getenv("TAIL_BARS", "0"))
 
 # -------- Portfolio constraints ----------
 MAX_POSITIONS = int(os.getenv("MAX_POSITIONS", "75"))
-CAPITAL_UTIL  = float(os.getenv("CAPITAL_UTIL", "0.75"))   # use 75% of equity at most
+CAPITAL_UTIL  = float(os.getenv("CAPITAL_UTIL", "0.75"))
 POS_FRACTION  = float(os.getenv("POS_FRACTION", "")) if os.getenv("POS_FRACTION") else (CAPITAL_UTIL / MAX_POSITIONS)
 
 # -------- Costs (bps) ----------
-# applied on entry and exit:
-SLIPPAGE_BPS   = float(os.getenv("SLIPPAGE_BPS", "5"))     # 5 bps = 0.05% per side
-COMMISSION_BPS = float(os.getenv("COMMISSION_BPS", "1"))   # 1 bps = 0.01% per side
+SLIPPAGE_BPS   = float(os.getenv("SLIPPAGE_BPS", "5"))     # per side
+COMMISSION_BPS = float(os.getenv("COMMISSION_BPS", "1"))   # per side
 
-RESULT_PREFIX = os.getenv("RESULT_PREFIX", "results/poos_hourly_v3_portfolio")
+# -------- NEW: Top-score filter ----------
+# Keep only trades with score >= quantile threshold.
+# 0.70 => keep top 30%
+SCORE_MIN_QUANTILE = float(os.getenv("SCORE_MIN_QUANTILE", "0.70"))
+
+RESULT_PREFIX = os.getenv("RESULT_PREFIX", "results/poos_hourly_v4_topscore")
 
 # ---------------- R2 client ----------------
 s3 = boto3.client(
@@ -138,7 +142,6 @@ def backtest_one(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
     hold = 0
     entry_time = None
 
-    # score captured at impulse moment; reused for the eventual entry
     watch_score = None
     watch_imp_ret = None
     watch_vol_ratio = None
@@ -199,7 +202,6 @@ def backtest_one(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
                 continue
 
             if hold >= MAX_HOLD_BARS:
-                exit_reason = "TIME"
                 exit_px = float(row["close"])
                 trades.append({
                     "ticker": ticker,
@@ -209,7 +211,7 @@ def backtest_one(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
                     "exit": float(exit_px),
                     "stop_init": float(initial_stop),
                     "tp": float(tp),
-                    "exit_reason": exit_reason,
+                    "exit_reason": "TIME",
                     "be_moved": bool(be_moved),
                     "hold_bars": int(hold),
                     "entry_ema": ema_col,
@@ -231,7 +233,6 @@ def backtest_one(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
         if not in_pos:
             if not watch:
                 if bool(row["is_impulse"]):
-                    # score: impulse strength * volume ratio
                     imp_ret = float(row["imp_ret"])
                     vol_ratio = float(row["vol_ratio"]) if not pd.isna(row["vol_ratio"]) else 0.0
                     watch_score = imp_ret * vol_ratio
@@ -263,11 +264,10 @@ def backtest_one(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
     return pd.DataFrame(trades)
 
 def apply_costs(entry_px: float, exit_px: float) -> tuple[float, float]:
-    # For long positions: entry worsens (higher), exit worsens (lower)
     slip = SLIPPAGE_BPS / 10000.0
     comm = COMMISSION_BPS / 10000.0
-    entry_adj = entry_px * (1.0 + slip + comm)
-    exit_adj  = exit_px  * (1.0 - slip - comm)
+    entry_adj = entry_px * (1.0 + slip + comm)  # worse for long
+    exit_adj  = exit_px  * (1.0 - slip - comm)  # worse for long
     return entry_adj, exit_adj
 
 def simulate_portfolio(trades: pd.DataFrame):
@@ -277,41 +277,33 @@ def simulate_portfolio(trades: pd.DataFrame):
     trades = trades.copy()
     trades["entry_time"] = pd.to_datetime(trades["entry_time"], utc=True)
     trades["exit_time"]  = pd.to_datetime(trades["exit_time"], utc=True)
-
-    # For ranking when too many entries at same time
     trades["score"] = pd.to_numeric(trades["score"], errors="coerce").fillna(0.0)
 
-    # Build entry groups
     trades = trades.sort_values(["entry_time", "score"], ascending=[True, False]).reset_index(drop=True)
     trades["trade_id"] = np.arange(len(trades))
 
     equity = 1.0
     curve = []
-    open_positions = {}  # trade_id -> dict(entry_time, exit_time, ret, pos_frac)
+    open_positions = {}  # trade_id -> dict
 
-    # We'll process events in time order: entry batches, then exits that occur before next entries
     entry_times = trades["entry_time"].sort_values().unique()
 
     def close_exits_up_to(t):
         nonlocal equity, open_positions, curve
         to_close = [tid for tid, pos in open_positions.items() if pos["exit_time"] <= t]
-        # close in chronological order
         to_close = sorted(to_close, key=lambda tid: open_positions[tid]["exit_time"])
         for tid in to_close:
             pos = open_positions.pop(tid)
-            # apply return to equity on close
             equity *= (1.0 + pos["pos_frac"] * pos["ret"])
             curve.append((pos["exit_time"], equity, "CLOSE", pos["ticker"], tid))
 
     for et in entry_times:
         close_exits_up_to(et)
 
-        # free slots
         free_slots = MAX_POSITIONS - len(open_positions)
         if free_slots <= 0:
             continue
 
-        # capital utilization constraint (approx): we limit sum(pos_frac) <= CAPITAL_UTIL
         used_frac = sum(pos["pos_frac"] for pos in open_positions.values())
         free_frac = max(0.0, CAPITAL_UTIL - used_frac)
         if free_frac <= 0:
@@ -321,8 +313,6 @@ def simulate_portfolio(trades: pd.DataFrame):
         if batch.empty:
             continue
 
-        # Determine how many we can open: by slots and by free_frac
-        # Each new position uses POS_FRACTION of equity (approx)
         max_by_frac = int(free_frac / POS_FRACTION) if POS_FRACTION > 0 else 0
         can_open = max(0, min(free_slots, max_by_frac))
         if can_open <= 0:
@@ -346,7 +336,6 @@ def simulate_portfolio(trades: pd.DataFrame):
             }
             curve.append((r["entry_time"], equity, "OPEN", r["ticker"], int(r["trade_id"])))
 
-    # close remaining
     close_exits_up_to(pd.Timestamp.max.tz_localize("UTC"))
 
     curve_df = pd.DataFrame(curve, columns=["time", "equity", "event", "ticker", "trade_id"])
@@ -375,15 +364,28 @@ def main():
             print("Error reading/backtesting", t, ":", e)
 
     trades = pd.concat(all_trades, ignore_index=True) if all_trades else pd.DataFrame()
-    print("Trades (raw signals):", len(trades))
+    raw_n = int(len(trades))
+    print("Trades (raw signals):", raw_n)
+
+    # -------- NEW: Top-score filter ----------
+    score_threshold = None
+    kept_n = 0
+    if not trades.empty:
+        trades["score"] = pd.to_numeric(trades["score"], errors="coerce").fillna(0.0)
+        score_threshold = float(trades["score"].quantile(SCORE_MIN_QUANTILE))
+        trades = trades[trades["score"] >= score_threshold].copy()
+        kept_n = int(len(trades))
+        print("Score filter:", SCORE_MIN_QUANTILE, "threshold:", score_threshold, "kept:", kept_n)
 
     equity_df, events_df = simulate_portfolio(trades)
 
-    # Stats
     stats = {
-        "mode": "POOS-style intraday (1h) PORTFOLIO",
+        "mode": "POOS-style intraday (1h) PORTFOLIO + TOP SCORE FILTER",
         "tickers_tested": int(len(tickers)),
-        "raw_trades": int(len(trades)) if not trades.empty else 0,
+        "raw_trades": raw_n,
+        "kept_trades_after_score_filter": kept_n,
+        "score_min_quantile": float(SCORE_MIN_QUANTILE),
+        "score_threshold": float(score_threshold) if score_threshold is not None else None,
         "max_positions": int(MAX_POSITIONS),
         "capital_util": float(CAPITAL_UTIL),
         "pos_fraction": float(POS_FRACTION),
@@ -400,15 +402,16 @@ def main():
         "move_be_pct": float(MOVE_BE_PCT),
         "entry_ema": int(ENTRY_EMA),
         "trend_filter": bool(USE_TREND_FILTER),
+        "tail_bars": int(TAIL_BARS),
     }
 
-    # Save outputs
     put_text(f"{RESULT_PREFIX}/stats.json", json.dumps(stats, indent=2))
 
+    # Save filtered trades and events/equity
     if not trades.empty:
-        put_text(f"{RESULT_PREFIX}/raw_trades.csv", trades.to_csv(index=False))
+        put_text(f"{RESULT_PREFIX}/filtered_trades.csv", trades.to_csv(index=False))
     else:
-        put_text(f"{RESULT_PREFIX}/raw_trades.csv", "ticker,entry_time,exit_time,entry,exit,stop_init,tp,exit_reason,be_moved,hold_bars,entry_ema,score,imp_ret,vol_ratio\n")
+        put_text(f"{RESULT_PREFIX}/filtered_trades.csv", "ticker,entry_time,exit_time,entry,exit,stop_init,tp,exit_reason,be_moved,hold_bars,entry_ema,score,imp_ret,vol_ratio\n")
 
     if not equity_df.empty:
         put_text(f"{RESULT_PREFIX}/equity.csv", equity_df.to_csv(index=False))
@@ -425,7 +428,7 @@ def main():
     if not equity_df.empty:
         plt.plot(pd.to_datetime(equity_df["time"]), equity_df["equity"])
         plt.xticks(rotation=30, ha="right")
-        plt.title("POOS-style Intraday Portfolio Equity (max 75 pos, costs)")
+        plt.title(f"POOS Intraday Portfolio Equity (Top {int((1-SCORE_MIN_QUANTILE)*100)}% score, costs)")
         plt.tight_layout()
     else:
         plt.text(0.5, 0.5, "No closes / No trades", ha="center", va="center")
