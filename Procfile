@@ -1,2 +1,3 @@
-worker: python src/download.py
+worker: python src/poos_backtest_hourly.py
+
 
