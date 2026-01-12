@@ -1,2 +1,3 @@
-worker: python src/poos_backtest_daily.py
+worker: python src/weekly_alpha_backtest.py
+
 
