@@ -1,1 +1,2 @@
-worker: python src/poos_backtest_hourly.py
+worker: python src/make_daily_from_hourly.py
+
