@@ -1,3 +1,3 @@
-worker: python src/weekly_alpha_backtest.py
+worker: python src/poos_market_engine.py
 
 
