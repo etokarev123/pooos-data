@@ -19,37 +19,36 @@ R2_KEY = os.environ["R2_ACCESS_KEY_ID"]
 R2_SECRET = os.environ["R2_SECRET_ACCESS_KEY"]
 R2_BUCKET = os.environ["R2_BUCKET"]
 
-# -------------- ENV (Intraday POOS-style) ------------
-# Intraday impulse: smaller and faster than daily POOS
-LOOKBACK_BARS = int(os.getenv("LOOKBACK_BARS", "20"))           # ~3 trading days
-IMPULSE_MIN_RET = float(os.getenv("IMPULSE_MIN_RET", "0.08"))   # 8% impulse
-VOL_MA_BARS = int(os.getenv("VOL_MA_BARS", "60"))               # ~8-9 trading days
-VOL_MULT = float(os.getenv("VOL_MULT", "1.3"))                  # 1.3x volume
+# -------------- ENV (POOS-style intraday) ------------
+LOOKBACK_BARS   = int(os.getenv("LOOKBACK_BARS", "20"))
+IMPULSE_MIN_RET = float(os.getenv("IMPULSE_MIN_RET", "0.08"))
+VOL_MA_BARS     = int(os.getenv("VOL_MA_BARS", "60"))
+VOL_MULT        = float(os.getenv("VOL_MULT", "1.3"))
 
-# Trend filter (lighter): close above EMA20 and EMA50, EMA20 > EMA50
 USE_TREND_FILTER = os.getenv("USE_TREND_FILTER", "1") == "1"
+ENTRY_EMA        = int(os.getenv("ENTRY_EMA", "20"))  # 20 or 10
 
-# Entry: pullback touch EMA20 (default). You can switch to EMA10 by env ENTRY_EMA=10
-ENTRY_EMA = int(os.getenv("ENTRY_EMA", "20"))
+ATR_PERIOD  = int(os.getenv("ATR_PERIOD", "14"))
+STOP_ATR    = float(os.getenv("STOP_ATR", "1.0"))
+TP_ATR      = float(os.getenv("TP_ATR", "1.5"))
+MOVE_BE_PCT = float(os.getenv("MOVE_BE_PCT", "0.01"))
 
-# Exits
-ATR_PERIOD = int(os.getenv("ATR_PERIOD", "14"))
-STOP_ATR = float(os.getenv("STOP_ATR", "1.0"))
-TP_ATR = float(os.getenv("TP_ATR", "1.5"))
-MOVE_BE_PCT = float(os.getenv("MOVE_BE_PCT", "0.01"))           # +1% => move stop to BE
+MAX_HOLD_BARS = int(os.getenv("MAX_HOLD_BARS", "120"))
+COOLOFF_BARS  = int(os.getenv("COOLOFF_BARS", "40"))
 
-# Trade management
-MAX_HOLD_BARS = int(os.getenv("MAX_HOLD_BARS", "120"))           # ~2-3 trading weeks
-COOLOFF_BARS = int(os.getenv("COOLOFF_BARS", "40"))              # ~1 trading week
-
-# Equity compounding (still simplified)
-RISK_PER_TRADE = float(os.getenv("RISK_PER_TRADE", "0.01"))
-
-# Speed: optionally use only last N bars
 TAIL_BARS = int(os.getenv("TAIL_BARS", "0"))
 
-# Store results here (new folder so you don't overwrite the previous "No trades")
-RESULT_PREFIX = os.getenv("RESULT_PREFIX", "results/poos_hourly_v2")
+# -------- Portfolio constraints ----------
+MAX_POSITIONS = int(os.getenv("MAX_POSITIONS", "75"))
+CAPITAL_UTIL  = float(os.getenv("CAPITAL_UTIL", "0.75"))   # use 75% of equity at most
+POS_FRACTION  = float(os.getenv("POS_FRACTION", "")) if os.getenv("POS_FRACTION") else (CAPITAL_UTIL / MAX_POSITIONS)
+
+# -------- Costs (bps) ----------
+# applied on entry and exit:
+SLIPPAGE_BPS   = float(os.getenv("SLIPPAGE_BPS", "5"))     # 5 bps = 0.05% per side
+COMMISSION_BPS = float(os.getenv("COMMISSION_BPS", "1"))   # 1 bps = 0.01% per side
+
+RESULT_PREFIX = os.getenv("RESULT_PREFIX", "results/poos_hourly_v3_portfolio")
 
 # ---------------- R2 client ----------------
 s3 = boto3.client(
@@ -106,21 +105,19 @@ def atr(df: pd.DataFrame, period: int) -> pd.Series:
 
 def backtest_one(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
     df = df.sort_values("date").dropna(subset=["open", "high", "low", "close", "volume"]).copy()
-    if "date" in df.columns:
-        df["date"] = pd.to_datetime(df["date"], utc=True)
+    df["date"] = pd.to_datetime(df["date"], utc=True)
 
     if TAIL_BARS > 0 and len(df) > TAIL_BARS:
         df = df.iloc[-TAIL_BARS:].copy()
 
-    # Indicators
     df["ema10"] = ema(df["close"], 10)
     df["ema20"] = ema(df["close"], 20)
     df["ema50"] = ema(df["close"], 50)
     df["atr"] = atr(df, ATR_PERIOD)
     df["vol_ma"] = df["volume"].rolling(VOL_MA_BARS, min_periods=VOL_MA_BARS).mean()
 
-    # Impulse
     df["imp_ret"] = df["close"] / df["close"].shift(LOOKBACK_BARS) - 1.0
+    df["vol_ratio"] = df["volume"] / df["vol_ma"]
     df["imp_vol_ok"] = df["volume"] > (VOL_MULT * df["vol_ma"])
 
     if USE_TREND_FILTER:
@@ -130,7 +127,6 @@ def backtest_one(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
 
     df["is_impulse"] = (df["imp_ret"] >= IMPULSE_MIN_RET) & df["imp_vol_ok"] & df["trend_ok"]
 
-    # Entry EMA choice
     ema_col = "ema20" if ENTRY_EMA == 20 else "ema10"
 
     in_pos = False
@@ -141,6 +137,11 @@ def backtest_one(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
     be_moved = False
     hold = 0
     entry_time = None
+
+    # score captured at impulse moment; reused for the eventual entry
+    watch_score = None
+    watch_imp_ret = None
+    watch_vol_ratio = None
 
     trades = []
 
@@ -155,7 +156,6 @@ def backtest_one(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
             hold += 1
             lo, hi = float(row["low"]), float(row["high"])
 
-            # Move to break-even
             if (not be_moved) and hi >= entry * (1.0 + MOVE_BE_PCT):
                 stop = entry
                 be_moved = True
@@ -163,7 +163,6 @@ def backtest_one(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
             exit_reason = None
             exit_px = None
 
-            # conservative: stop first if both touched
             if lo <= stop:
                 exit_reason = "STOP"
                 exit_px = stop
@@ -172,8 +171,6 @@ def backtest_one(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
                 exit_px = tp
 
             if exit_reason:
-                risk_per_share = entry - initial_stop
-                r_mult = (exit_px - entry) / risk_per_share if (risk_per_share and risk_per_share > 0) else 0.0
                 trades.append({
                     "ticker": ticker,
                     "entry_time": entry_time,
@@ -183,10 +180,12 @@ def backtest_one(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
                     "stop_init": float(initial_stop),
                     "tp": float(tp),
                     "exit_reason": exit_reason,
-                    "r_mult": float(r_mult),
                     "be_moved": bool(be_moved),
                     "hold_bars": int(hold),
                     "entry_ema": ema_col,
+                    "score": float(watch_score) if watch_score is not None else np.nan,
+                    "imp_ret": float(watch_imp_ret) if watch_imp_ret is not None else np.nan,
+                    "vol_ratio": float(watch_vol_ratio) if watch_vol_ratio is not None else np.nan,
                 })
 
                 in_pos = False
@@ -196,12 +195,12 @@ def backtest_one(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
                 be_moved = False
                 hold = 0
                 entry_time = None
+                watch_score = watch_imp_ret = watch_vol_ratio = None
                 continue
 
             if hold >= MAX_HOLD_BARS:
+                exit_reason = "TIME"
                 exit_px = float(row["close"])
-                risk_per_share = entry - initial_stop
-                r_mult = (exit_px - entry) / risk_per_share if (risk_per_share and risk_per_share > 0) else 0.0
                 trades.append({
                     "ticker": ticker,
                     "entry_time": entry_time,
@@ -210,11 +209,13 @@ def backtest_one(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
                     "exit": float(exit_px),
                     "stop_init": float(initial_stop),
                     "tp": float(tp),
-                    "exit_reason": "TIME",
-                    "r_mult": float(r_mult),
+                    "exit_reason": exit_reason,
                     "be_moved": bool(be_moved),
                     "hold_bars": int(hold),
                     "entry_ema": ema_col,
+                    "score": float(watch_score) if watch_score is not None else np.nan,
+                    "imp_ret": float(watch_imp_ret) if watch_imp_ret is not None else np.nan,
+                    "vol_ratio": float(watch_vol_ratio) if watch_vol_ratio is not None else np.nan,
                 })
 
                 in_pos = False
@@ -224,17 +225,23 @@ def backtest_one(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
                 be_moved = False
                 hold = 0
                 entry_time = None
+                watch_score = watch_imp_ret = watch_vol_ratio = None
                 continue
 
-        # Not in position
         if not in_pos:
             if not watch:
                 if bool(row["is_impulse"]):
+                    # score: impulse strength * volume ratio
+                    imp_ret = float(row["imp_ret"])
+                    vol_ratio = float(row["vol_ratio"]) if not pd.isna(row["vol_ratio"]) else 0.0
+                    watch_score = imp_ret * vol_ratio
+                    watch_imp_ret = imp_ret
+                    watch_vol_ratio = vol_ratio
                     watch = True
             else:
-                # If trend breaks badly, drop watch
                 if USE_TREND_FILTER and (not bool(row["trend_ok"])):
                     watch = False
+                    watch_score = watch_imp_ret = watch_vol_ratio = None
                     continue
 
                 a = row["atr"]
@@ -242,7 +249,6 @@ def backtest_one(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
                 if pd.isna(a) or pd.isna(e):
                     continue
 
-                # Pullback "touch" entry: low <= entry_ema
                 if float(row["low"]) <= float(e):
                     entry = float(e)
                     entry_time = t
@@ -255,6 +261,97 @@ def backtest_one(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
                     watch = False
 
     return pd.DataFrame(trades)
+
+def apply_costs(entry_px: float, exit_px: float) -> tuple[float, float]:
+    # For long positions: entry worsens (higher), exit worsens (lower)
+    slip = SLIPPAGE_BPS / 10000.0
+    comm = COMMISSION_BPS / 10000.0
+    entry_adj = entry_px * (1.0 + slip + comm)
+    exit_adj  = exit_px  * (1.0 - slip - comm)
+    return entry_adj, exit_adj
+
+def simulate_portfolio(trades: pd.DataFrame):
+    if trades.empty:
+        return pd.DataFrame(columns=["time", "equity"]), pd.DataFrame()
+
+    trades = trades.copy()
+    trades["entry_time"] = pd.to_datetime(trades["entry_time"], utc=True)
+    trades["exit_time"]  = pd.to_datetime(trades["exit_time"], utc=True)
+
+    # For ranking when too many entries at same time
+    trades["score"] = pd.to_numeric(trades["score"], errors="coerce").fillna(0.0)
+
+    # Build entry groups
+    trades = trades.sort_values(["entry_time", "score"], ascending=[True, False]).reset_index(drop=True)
+    trades["trade_id"] = np.arange(len(trades))
+
+    equity = 1.0
+    curve = []
+    open_positions = {}  # trade_id -> dict(entry_time, exit_time, ret, pos_frac)
+
+    # We'll process events in time order: entry batches, then exits that occur before next entries
+    entry_times = trades["entry_time"].sort_values().unique()
+
+    def close_exits_up_to(t):
+        nonlocal equity, open_positions, curve
+        to_close = [tid for tid, pos in open_positions.items() if pos["exit_time"] <= t]
+        # close in chronological order
+        to_close = sorted(to_close, key=lambda tid: open_positions[tid]["exit_time"])
+        for tid in to_close:
+            pos = open_positions.pop(tid)
+            # apply return to equity on close
+            equity *= (1.0 + pos["pos_frac"] * pos["ret"])
+            curve.append((pos["exit_time"], equity, "CLOSE", pos["ticker"], tid))
+
+    for et in entry_times:
+        close_exits_up_to(et)
+
+        # free slots
+        free_slots = MAX_POSITIONS - len(open_positions)
+        if free_slots <= 0:
+            continue
+
+        # capital utilization constraint (approx): we limit sum(pos_frac) <= CAPITAL_UTIL
+        used_frac = sum(pos["pos_frac"] for pos in open_positions.values())
+        free_frac = max(0.0, CAPITAL_UTIL - used_frac)
+        if free_frac <= 0:
+            continue
+
+        batch = trades[trades["entry_time"] == et].copy()
+        if batch.empty:
+            continue
+
+        # Determine how many we can open: by slots and by free_frac
+        # Each new position uses POS_FRACTION of equity (approx)
+        max_by_frac = int(free_frac / POS_FRACTION) if POS_FRACTION > 0 else 0
+        can_open = max(0, min(free_slots, max_by_frac))
+        if can_open <= 0:
+            continue
+
+        batch = batch.sort_values("score", ascending=False).head(can_open)
+
+        for _, r in batch.iterrows():
+            entry_px = float(r["entry"])
+            exit_px  = float(r["exit"])
+            entry_adj, exit_adj = apply_costs(entry_px, exit_px)
+            ret = (exit_adj / entry_adj) - 1.0
+
+            open_positions[int(r["trade_id"])] = {
+                "ticker": r["ticker"],
+                "entry_time": r["entry_time"],
+                "exit_time": r["exit_time"],
+                "ret": ret,
+                "pos_frac": POS_FRACTION,
+                "score": float(r["score"]),
+            }
+            curve.append((r["entry_time"], equity, "OPEN", r["ticker"], int(r["trade_id"])))
+
+    # close remaining
+    close_exits_up_to(pd.Timestamp.max.tz_localize("UTC"))
+
+    curve_df = pd.DataFrame(curve, columns=["time", "equity", "event", "ticker", "trade_id"])
+    equity_points = curve_df[curve_df["event"] == "CLOSE"][["time", "equity"]].reset_index(drop=True)
+    return equity_points, curve_df
 
 def main():
     tickers = list_parquet_tickers("yahoo/1h/")
@@ -278,31 +375,21 @@ def main():
             print("Error reading/backtesting", t, ":", e)
 
     trades = pd.concat(all_trades, ignore_index=True) if all_trades else pd.DataFrame()
-    print("Trades:", len(trades))
+    print("Trades (raw signals):", len(trades))
 
-    # Equity (simple trade-by-trade compound)
-    equity = 1.0
-    curve = []
-    if not trades.empty:
-        trades["entry_time"] = pd.to_datetime(trades["entry_time"], utc=True)
-        trades["exit_time"] = pd.to_datetime(trades["exit_time"], utc=True)
-        trades = trades.sort_values("exit_time")
+    equity_df, events_df = simulate_portfolio(trades)
 
-        for _, r in trades.iterrows():
-            equity *= (1.0 + RISK_PER_TRADE * float(r["r_mult"]))
-            curve.append((r["exit_time"], equity))
-
-    equity_df = pd.DataFrame(curve, columns=["time", "equity"])
-
+    # Stats
     stats = {
-        "mode": "POOS-style intraday (1h)",
+        "mode": "POOS-style intraday (1h) PORTFOLIO",
         "tickers_tested": int(len(tickers)),
-        "trades": int(len(trades)) if not trades.empty else 0,
-        "win_rate": float((trades["r_mult"] > 0).mean()) if not trades.empty else 0.0,
-        "avg_R": float(trades["r_mult"].mean()) if not trades.empty else 0.0,
-        "median_R": float(trades["r_mult"].median()) if not trades.empty else 0.0,
-        "final_equity_trade_compound": float(equity),
-        "risk_per_trade": float(RISK_PER_TRADE),
+        "raw_trades": int(len(trades)) if not trades.empty else 0,
+        "max_positions": int(MAX_POSITIONS),
+        "capital_util": float(CAPITAL_UTIL),
+        "pos_fraction": float(POS_FRACTION),
+        "slippage_bps_per_side": float(SLIPPAGE_BPS),
+        "commission_bps_per_side": float(COMMISSION_BPS),
+        "final_equity": float(equity_df["equity"].iloc[-1]) if not equity_df.empty else 1.0,
         "lookback_bars": int(LOOKBACK_BARS),
         "impulse_min_ret": float(IMPULSE_MIN_RET),
         "vol_mult": float(VOL_MULT),
@@ -315,27 +402,33 @@ def main():
         "trend_filter": bool(USE_TREND_FILTER),
     }
 
-    # Save outputs to R2
+    # Save outputs
+    put_text(f"{RESULT_PREFIX}/stats.json", json.dumps(stats, indent=2))
+
     if not trades.empty:
-        put_text(f"{RESULT_PREFIX}/trades.csv", trades.to_csv(index=False))
+        put_text(f"{RESULT_PREFIX}/raw_trades.csv", trades.to_csv(index=False))
     else:
-        put_text(f"{RESULT_PREFIX}/trades.csv", "ticker,entry_time,exit_time,entry,exit,stop_init,tp,exit_reason,r_mult,be_moved,hold_bars,entry_ema\n")
+        put_text(f"{RESULT_PREFIX}/raw_trades.csv", "ticker,entry_time,exit_time,entry,exit,stop_init,tp,exit_reason,be_moved,hold_bars,entry_ema,score,imp_ret,vol_ratio\n")
 
     if not equity_df.empty:
         put_text(f"{RESULT_PREFIX}/equity.csv", equity_df.to_csv(index=False))
     else:
         put_text(f"{RESULT_PREFIX}/equity.csv", "time,equity\n")
 
-    put_text(f"{RESULT_PREFIX}/stats.json", json.dumps(stats, indent=2))
+    if not events_df.empty:
+        put_text(f"{RESULT_PREFIX}/events.csv", events_df.to_csv(index=False))
+    else:
+        put_text(f"{RESULT_PREFIX}/events.csv", "time,equity,event,ticker,trade_id\n")
 
+    # Plot equity
     plt.figure()
     if not equity_df.empty:
-        plt.plot(equity_df["time"], equity_df["equity"])
+        plt.plot(pd.to_datetime(equity_df["time"]), equity_df["equity"])
         plt.xticks(rotation=30, ha="right")
-        plt.title("POOS-style Intraday (1h) Equity (trade-compounded)")
+        plt.title("POOS-style Intraday Portfolio Equity (max 75 pos, costs)")
         plt.tight_layout()
     else:
-        plt.text(0.5, 0.5, "No trades", ha="center", va="center")
+        plt.text(0.5, 0.5, "No closes / No trades", ha="center", va="center")
         plt.axis("off")
 
     buf = io.BytesIO()
