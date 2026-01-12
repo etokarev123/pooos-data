@@ -1,6 +1,9 @@
-import os
-import io
-import json
+# --- отличия от предыдущей версии ---
+# 1) добавлен IMPULSE_MEMORY_DAYS (по умолчанию 7)
+# 2) watch стартует по impulse_recent, а не только в день импульса
+# 3) сохраняем диагностику: сколько импульсов и сколько из них в risk_on
+
+import os, io, json
 import pandas as pd
 import numpy as np
 import boto3
@@ -13,27 +16,24 @@ import matplotlib.pyplot as plt
 
 load_dotenv()
 
-# ---------------- R2 ----------------
 R2_ENDPOINT = os.environ["R2_ENDPOINT"]
 R2_KEY = os.environ["R2_ACCESS_KEY_ID"]
 R2_SECRET = os.environ["R2_SECRET_ACCESS_KEY"]
 R2_BUCKET = os.environ["R2_BUCKET"]
 
 DATA_PREFIX = os.getenv("DATA_PREFIX", "yahoo/1d/")
-# Market engine output path:
-MARKET_STATE_KEY = os.getenv(
-    "MARKET_STATE_KEY",
-    "results/poos_market_engine_v1/market_state.csv"
-)
+MARKET_STATE_KEY = os.getenv("MARKET_STATE_KEY", "results/poos_market_engine_v1/market_state.csv")
 
-# ---------------- POOS (DAILY) ----------------
 IMP_LOOKBACK_DAYS = int(os.getenv("IMP_LOOKBACK_DAYS", "20"))
-IMP_MIN_RET = float(os.getenv("IMP_MIN_RET", "0.30"))       # daily impulse threshold
+IMP_MIN_RET = float(os.getenv("IMP_MIN_RET", "0.30"))
 VOL_MA_DAYS = int(os.getenv("VOL_MA_DAYS", "20"))
 VOL_MULT = float(os.getenv("VOL_MULT", "2.0"))
 
+# ВАЖНО: память импульса
+IMPULSE_MEMORY_DAYS = int(os.getenv("IMPULSE_MEMORY_DAYS", "7"))
+
 USE_TREND_FILTER = os.getenv("USE_TREND_FILTER", "1") == "1"
-ENTRY_EMA = int(os.getenv("ENTRY_EMA", "20"))               # pullback to EMA
+ENTRY_EMA = int(os.getenv("ENTRY_EMA", "20"))
 
 ATR_PERIOD = int(os.getenv("ATR_PERIOD", "14"))
 STOP_ATR = float(os.getenv("STOP_ATR", "1.0"))
@@ -42,30 +42,20 @@ MOVE_BE_PCT = float(os.getenv("MOVE_BE_PCT", "0.01"))
 
 MAX_HOLD_DAYS = int(os.getenv("MAX_HOLD_DAYS", "15"))
 COOLOFF_DAYS = int(os.getenv("COOLOFF_DAYS", "10"))
+TAIL_DAYS = int(os.getenv("TAIL_DAYS", "504"))
 
-TAIL_DAYS = int(os.getenv("TAIL_DAYS", "504"))              # keep last ~2y by default
-
-# -------------- Portfolio --------------
-MAX_POSITIONS = int(os.getenv("MAX_POSITIONS", "40"))       # daily POOS usually not 75
+MAX_POSITIONS = int(os.getenv("MAX_POSITIONS", "40"))
 CAPITAL_UTIL  = float(os.getenv("CAPITAL_UTIL", "0.75"))
 POS_FRACTION  = float(os.getenv("POS_FRACTION", "")) if os.getenv("POS_FRACTION") else (CAPITAL_UTIL / MAX_POSITIONS)
 
-# -------------- Costs --------------
 SLIPPAGE_BPS   = float(os.getenv("SLIPPAGE_BPS", "5"))
 COMMISSION_BPS = float(os.getenv("COMMISSION_BPS", "1"))
 
-# -------------- Market gating rules --------------
-# Open new trades only in these market states
-ALLOW_ENTRY_STATES = os.getenv("ALLOW_ENTRY_STATES", "risk_on").split(",")
-ALLOW_ENTRY_STATES = [s.strip() for s in ALLOW_ENTRY_STATES if s.strip()]
-
-# Force exit when state becomes one of these
-FORCE_EXIT_STATES = os.getenv("FORCE_EXIT_STATES", "risk_off").split(",")
-FORCE_EXIT_STATES = [s.strip() for s in FORCE_EXIT_STATES if s.strip()]
+ALLOW_ENTRY_STATES = [s.strip() for s in os.getenv("ALLOW_ENTRY_STATES", "risk_on").split(",") if s.strip()]
+FORCE_EXIT_STATES  = [s.strip() for s in os.getenv("FORCE_EXIT_STATES", "risk_off").split(",") if s.strip()]
 
 RESULT_PREFIX = os.getenv("RESULT_PREFIX", "results/poos_daily_v2_market_gated")
 
-# ---------------- R2 client ----------------
 s3 = boto3.client(
     "s3",
     endpoint_url=R2_ENDPOINT,
@@ -127,26 +117,18 @@ def apply_costs(entry_px: float, exit_px: float) -> tuple[float, float]:
     return entry_adj, exit_adj
 
 def load_market_state() -> pd.DataFrame:
-    txt = read_text(MARKET_STATE_KEY)
-    ms = pd.read_csv(io.StringIO(txt))
+    ms = pd.read_csv(io.StringIO(read_text(MARKET_STATE_KEY)))
     ms["date"] = pd.to_datetime(ms["date"], utc=True)
-    ms = ms.sort_values("date")
-    return ms[["date","market_state","market_score"]]
+    ms["d"] = ms["date"].dt.normalize()
+    return ms[["date","d","market_state","market_score"]].sort_values("date")
 
-def generate_trades(df: pd.DataFrame, ticker: str, ms_map: dict) -> pd.DataFrame:
-    """
-    Generates candidate trades BUT:
-    - will only start watching impulses if market_state allows entries on that day
-    - will store market_state at entry time
-    Note: forced exits are handled in portfolio sim (needs global calendar)
-    """
+def generate_trades(df: pd.DataFrame, ticker: str, ms_map: dict) -> tuple[pd.DataFrame, dict]:
     df = df.sort_values("date").dropna(subset=["open","high","low","close","volume"]).copy()
     df["date"] = pd.to_datetime(df["date"], utc=True)
 
     if TAIL_DAYS > 0 and len(df) > TAIL_DAYS:
         df = df.iloc[-TAIL_DAYS:].copy()
 
-    df["ema10"]  = ema(df["close"], 10)
     df["ema20"]  = ema(df["close"], 20)
     df["ema50"]  = ema(df["close"], 50)
     df["ema200"] = ema(df["close"], 200)
@@ -163,7 +145,14 @@ def generate_trades(df: pd.DataFrame, ticker: str, ms_map: dict) -> pd.DataFrame
 
     df["is_impulse"] = (df["imp_ret"] >= IMP_MIN_RET) & df["vol_ok"] & df["trend_ok"]
 
-    ema_col = "ema20" if ENTRY_EMA == 20 else "ema10"
+    # ✅ POOS memory: импульс был недавно
+    df["impulse_recent"] = (
+        df["is_impulse"]
+        .rolling(IMPULSE_MEMORY_DAYS, min_periods=1)
+        .max()
+        .fillna(0)
+        .astype(int)
+    )
 
     in_pos = False
     watch = False
@@ -174,22 +163,26 @@ def generate_trades(df: pd.DataFrame, ticker: str, ms_map: dict) -> pd.DataFrame
     hold = 0
     entry_time = None
     entry_mstate = None
-
     watch_score = None
 
     trades = []
 
-    dates = df["date"].tolist()
+    # diagnostics
+    diag = {
+        "rows": int(len(df)),
+        "impulses": int(df["is_impulse"].sum()),
+        "impulse_recent_days": int(df["impulse_recent"].sum())
+    }
 
     for i in range(len(df)):
         row = df.iloc[i]
         t = row["date"]
+        d = t.normalize()
 
         if i <= cooldown_until:
             continue
 
-        # Market state for this date (if missing, treat as neutral)
-        mstate = ms_map.get(t.normalize(), "neutral")
+        mstate = ms_map.get(d, "neutral")
 
         if in_pos:
             hold += 1
@@ -199,92 +192,68 @@ def generate_trades(df: pd.DataFrame, ticker: str, ms_map: dict) -> pd.DataFrame
                 stop = entry
                 be_moved = True
 
-            exit_reason = None
-            exit_px = None
-
-            # Standard exits (forced exits handled later globally)
             if lo <= stop:
-                exit_reason = "STOP"
                 exit_px = stop
-            elif hi >= tp:
-                exit_reason = "TP"
-                exit_px = tp
-
-            if exit_reason is not None:
                 trades.append({
-                    "ticker": ticker,
-                    "entry_time": entry_time,
-                    "exit_time": t,
-                    "entry": float(entry),
-                    "exit": float(exit_px),
-                    "stop_init": float(initial_stop),
-                    "tp": float(tp),
-                    "exit_reason": exit_reason,
-                    "hold_days": int(hold),
-                    "be_moved": bool(be_moved),
-                    "score": float(watch_score) if watch_score is not None else np.nan,
-                    "entry_market_state": entry_mstate,
+                    "ticker": ticker, "entry_time": entry_time, "exit_time": t,
+                    "entry": float(entry), "exit": float(exit_px),
+                    "stop_init": float(initial_stop), "tp": float(tp),
+                    "exit_reason": "STOP", "hold_days": int(hold),
+                    "be_moved": bool(be_moved), "score": float(watch_score) if watch_score else np.nan,
+                    "entry_market_state": entry_mstate
                 })
                 in_pos = False
-                watch = False
                 cooldown_until = i + COOLOFF_DAYS
-                entry = stop = tp = initial_stop = None
-                be_moved = False
-                hold = 0
-                entry_time = None
-                entry_mstate = None
-                watch_score = None
+                continue
+
+            if hi >= tp:
+                exit_px = tp
+                trades.append({
+                    "ticker": ticker, "entry_time": entry_time, "exit_time": t,
+                    "entry": float(entry), "exit": float(exit_px),
+                    "stop_init": float(initial_stop), "tp": float(tp),
+                    "exit_reason": "TP", "hold_days": int(hold),
+                    "be_moved": bool(be_moved), "score": float(watch_score) if watch_score else np.nan,
+                    "entry_market_state": entry_mstate
+                })
+                in_pos = False
+                cooldown_until = i + COOLOFF_DAYS
                 continue
 
             if hold >= MAX_HOLD_DAYS:
                 exit_px = float(row["close"])
                 trades.append({
-                    "ticker": ticker,
-                    "entry_time": entry_time,
-                    "exit_time": t,
-                    "entry": float(entry),
-                    "exit": float(exit_px),
-                    "stop_init": float(initial_stop),
-                    "tp": float(tp),
-                    "exit_reason": "TIME",
-                    "hold_days": int(hold),
-                    "be_moved": bool(be_moved),
-                    "score": float(watch_score) if watch_score is not None else np.nan,
-                    "entry_market_state": entry_mstate,
+                    "ticker": ticker, "entry_time": entry_time, "exit_time": t,
+                    "entry": float(entry), "exit": float(exit_px),
+                    "stop_init": float(initial_stop), "tp": float(tp),
+                    "exit_reason": "TIME", "hold_days": int(hold),
+                    "be_moved": bool(be_moved), "score": float(watch_score) if watch_score else np.nan,
+                    "entry_market_state": entry_mstate
                 })
                 in_pos = False
-                watch = False
                 cooldown_until = i + COOLOFF_DAYS
-                entry = stop = tp = initial_stop = None
-                be_moved = False
-                hold = 0
-                entry_time = None
-                entry_mstate = None
-                watch_score = None
                 continue
 
         if not in_pos:
             if not watch:
-                # Only start "watch" if market allows entries today
-                if mstate in ALLOW_ENTRY_STATES and bool(row["is_impulse"]):
+                # ✅ ВАЖНО: watch можно начать, если импульс был недавно, а рынок сейчас risk_on
+                if (mstate in ALLOW_ENTRY_STATES) and bool(row["impulse_recent"]):
                     vol_ratio = float(row["volume"] / row["vol_ma"]) if row["vol_ma"] and not pd.isna(row["vol_ma"]) else 0.0
                     watch_score = float(row["imp_ret"]) * vol_ratio
                     watch = True
             else:
-                # If market no longer allows entries, cancel watch
                 if mstate not in ALLOW_ENTRY_STATES:
                     watch = False
                     watch_score = None
                     continue
 
-                # If trend breaks, stop watching
                 if USE_TREND_FILTER and (not bool(row["trend_ok"])):
                     watch = False
                     watch_score = None
                     continue
 
                 a = row["atr"]
-                e = row[ema_col]
+                e = row["ema20"]
                 if pd.isna(a) or pd.isna(e):
                     continue
 
@@ -300,20 +269,9 @@ def generate_trades(df: pd.DataFrame, ticker: str, ms_map: dict) -> pd.DataFrame
                     be_moved = False
                     hold = 0
 
-    return pd.DataFrame(trades)
+    return pd.DataFrame(trades), diag
 
-def simulate_portfolio_with_forced_exits(trades: pd.DataFrame, market_state: pd.DataFrame):
-    """
-    Portfolio sim:
-    - Equal position fraction POS_FRACTION, max MAX_POSITIONS
-    - Opens at entry_time
-    - Normally closes at trade exit_time
-    - BUT if market_state turns into FORCE_EXIT_STATES while position open:
-        close at that day's close (market exit)
-    Since we don't have intraday execution on daily, we treat market exits as end-of-day close.
-
-    Costs applied via apply_costs on entry/exit prices.
-    """
+def simulate_portfolio(trades: pd.DataFrame, market_state: pd.DataFrame):
     if trades.empty:
         return pd.DataFrame(columns=["time","equity"]), pd.DataFrame()
 
@@ -321,26 +279,14 @@ def simulate_portfolio_with_forced_exits(trades: pd.DataFrame, market_state: pd.
     trades["entry_time"] = pd.to_datetime(trades["entry_time"], utc=True)
     trades["exit_time"]  = pd.to_datetime(trades["exit_time"], utc=True)
 
-    # Build a market_state dict by date (normalized)
     ms = market_state.copy()
-    ms["date"] = pd.to_datetime(ms["date"], utc=True)
-    ms["d"] = ms["date"].dt.normalize()
     ms_map = dict(zip(ms["d"], ms["market_state"]))
 
-    # To compute forced exits at close price, we need the daily close per ticker per date.
-    # We'll rely on trade rows only for entry/exit levels; for market exit we will approximate exit at "exit" price
-    # by setting it to the trade's exit price if the forced exit date == trade exit date.
-    # For true accuracy we'd need full daily series in sim. MVP: do a second pass that loads only tickers involved.
-    # We'll do that: load daily close per ticker for dates in range.
-
-    # Identify tickers used
     tickers = sorted(trades["ticker"].unique().tolist())
-
-    # Determine date range
     start = trades["entry_time"].min().normalize()
-    end = max(trades["exit_time"].max().normalize(), ms["d"].max())
+    end = trades["exit_time"].max().normalize()
 
-    close_map = {}  # (ticker, date_norm) -> close
+    close_map = {}
     for t in tickers:
         try:
             df = read_parquet(f"{DATA_PREFIX}{t}.parquet")
@@ -349,60 +295,44 @@ def simulate_portfolio_with_forced_exits(trades: pd.DataFrame, market_state: pd.
             df = df[(df["d"] >= start) & (df["d"] <= end)]
             close_map.update({(t, d): float(c) for d, c in zip(df["d"], df["close"])})
         except Exception as e:
-            print("Error loading closes for", t, e)
+            print("close load err", t, e)
 
-    # Sort trades by entry then score (higher first)
     trades["score"] = pd.to_numeric(trades.get("score", 0.0), errors="coerce").fillna(0.0)
     trades = trades.sort_values(["entry_time","score"], ascending=[True, False]).reset_index(drop=True)
     trades["trade_id"] = np.arange(len(trades))
 
     equity = 1.0
     events = []
-    open_pos = {}  # trade_id -> dict
+    open_pos = {}
 
     entry_times = trades["entry_time"].sort_values().unique()
 
-    # Helper: close positions up to a timestamp (normal closes)
     def close_positions_by_time(tstamp):
-        nonlocal equity, open_pos, events
+        nonlocal equity
         to_close = [tid for tid, pos in open_pos.items() if pos["close_time"] <= tstamp]
-        to_close = sorted(to_close, key=lambda tid: open_pos[tid]["close_time"])
-        for tid in to_close:
+        for tid in sorted(to_close, key=lambda tid: open_pos[tid]["close_time"]):
             pos = open_pos.pop(tid)
             equity *= (1.0 + pos["pos_frac"] * pos["ret"])
             events.append((pos["close_time"], equity, "CLOSE", pos["ticker"], tid, pos["close_reason"]))
 
-    # Helper: check forced exits on a given date (end of that day)
     def force_exit_on_day(d_norm, close_time):
-        nonlocal equity, open_pos, events
+        nonlocal equity
         if ms_map.get(d_norm, "neutral") not in FORCE_EXIT_STATES:
             return
-        # Close all open positions at that day's close
         to_close = list(open_pos.keys())
         for tid in sorted(to_close, key=lambda x: open_pos[x]["close_time"]):
             pos = open_pos.pop(tid)
-            # exit at close of day
-            px_close = close_map.get((pos["ticker"], d_norm), None)
-            if px_close is None:
-                # fallback: use planned exit_px
-                px_close = pos["planned_exit_px"]
-
+            px_close = close_map.get((pos["ticker"], d_norm), pos["planned_exit_px"])
             entry_adj, exit_adj = apply_costs(pos["entry_px"], float(px_close))
             ret = (exit_adj / entry_adj) - 1.0
-
             equity *= (1.0 + pos["pos_frac"] * ret)
             events.append((close_time, equity, "FORCE_EXIT", pos["ticker"], tid, "MARKET_RISK_OFF"))
 
     for et in entry_times:
-        # First, close normal exits up to entry time
         close_positions_by_time(et)
-
-        # Also apply forced exits for any dates between last event and this entry day.
-        # MVP simplification: we only check forced exit on the entry day before opening.
         d_et = pd.to_datetime(et, utc=True).normalize()
         force_exit_on_day(d_et, et)
 
-        # Open new positions
         free_slots = MAX_POSITIONS - len(open_pos)
         if free_slots <= 0:
             continue
@@ -414,7 +344,6 @@ def simulate_portfolio_with_forced_exits(trades: pd.DataFrame, market_state: pd.
         batch = trades[trades["entry_time"] == et].copy()
         if batch.empty:
             continue
-
         max_by_frac = int(free_frac / POS_FRACTION) if POS_FRACTION > 0 else 0
         can_open = max(0, min(free_slots, max_by_frac))
         if can_open <= 0:
@@ -440,10 +369,8 @@ def simulate_portfolio_with_forced_exits(trades: pd.DataFrame, market_state: pd.
             }
             events.append((r["entry_time"], equity, "OPEN", r["ticker"], int(r["trade_id"]), ""))
 
-        # After opening, also check forced exit on that day close (same-day risk-off)
         force_exit_on_day(d_et, et)
 
-    # Close remaining positions by their planned exit times
     close_positions_by_time(pd.Timestamp.max.tz_localize("UTC"))
 
     events_df = pd.DataFrame(events, columns=["time","equity","event","ticker","trade_id","reason"])
@@ -451,22 +378,23 @@ def simulate_portfolio_with_forced_exits(trades: pd.DataFrame, market_state: pd.
     return equity_df, events_df
 
 def main():
-    # Load market state
     ms = load_market_state()
-    ms["d"] = ms["date"].dt.normalize()
     ms_map = dict(zip(ms["d"], ms["market_state"]))
 
-    tickers = list_tickers(DATA_PREFIX)
-    tickers = [t for t in tickers if t != "SPY"]  # just in case
-    print("Daily tickers in R2:", len(tickers))
+    tickers = [t for t in list_tickers(DATA_PREFIX)]
+    print("Tickers:", len(tickers))
 
     all_trades = []
+    diags = []
+
     for i, t in enumerate(tickers, 1):
         try:
             df = read_parquet(f"{DATA_PREFIX}{t}.parquet")
             if df is None or df.empty:
                 continue
-            tr = generate_trades(df, t, ms_map)
+            tr, diag = generate_trades(df, t, ms_map)
+            diag["ticker"] = t
+            diags.append(diag)
             if not tr.empty:
                 all_trades.append(tr)
             if i % 50 == 0:
@@ -475,50 +403,39 @@ def main():
             print("Error:", t, e)
 
     trades = pd.concat(all_trades, ignore_index=True) if all_trades else pd.DataFrame()
-    print("Trades:", len(trades))
+    diag_df = pd.DataFrame(diags)
 
-    equity_df, events_df = simulate_portfolio_with_forced_exits(trades, ms)
+    equity_df, events_df = simulate_portfolio(trades, ms)
 
-    # Stats
     stats = {
-        "mode": "POOS DAILY + MARKET ENGINE GATING",
+        "mode": "POOS DAILY + MARKET ENGINE GATING (impulse memory fixed)",
         "tickers_tested": int(len(tickers)),
         "trades": int(len(trades)) if not trades.empty else 0,
         "final_equity": float(equity_df["equity"].iloc[-1]) if not equity_df.empty else 1.0,
-        "max_positions": int(MAX_POSITIONS),
-        "capital_util": float(CAPITAL_UTIL),
-        "pos_fraction": float(POS_FRACTION),
-        "slippage_bps_per_side": float(SLIPPAGE_BPS),
-        "commission_bps_per_side": float(COMMISSION_BPS),
+        "impulse_memory_days": int(IMPULSE_MEMORY_DAYS),
         "allow_entry_states": ALLOW_ENTRY_STATES,
         "force_exit_states": FORCE_EXIT_STATES,
         "imp_lookback_days": int(IMP_LOOKBACK_DAYS),
         "imp_min_ret": float(IMP_MIN_RET),
-        "vol_ma_days": int(VOL_MA_DAYS),
         "vol_mult": float(VOL_MULT),
-        "entry_ema": int(ENTRY_EMA),
-        "atr_period": int(ATR_PERIOD),
-        "stop_atr": float(STOP_ATR),
-        "tp_atr": float(TP_ATR),
-        "move_be_pct": float(MOVE_BE_PCT),
-        "max_hold_days": int(MAX_HOLD_DAYS),
-        "cooloff_days": int(COOLOFF_DAYS),
-        "tail_days": int(TAIL_DAYS),
-        "market_state_key": MARKET_STATE_KEY,
         "market_state_counts": ms["market_state"].value_counts().to_dict(),
+        "impulse_diag_sum": {
+            "impulses_total": int(diag_df["impulses"].sum()) if not diag_df.empty else 0,
+            "impulse_recent_days_total": int(diag_df["impulse_recent_days"].sum()) if not diag_df.empty else 0,
+        }
     }
 
     put_text(f"{RESULT_PREFIX}/stats.json", json.dumps(stats, indent=2))
     put_text(f"{RESULT_PREFIX}/trades.csv", trades.to_csv(index=False) if not trades.empty else "ticker,entry_time,exit_time,entry,exit,stop_init,tp,exit_reason,hold_days,be_moved,score,entry_market_state\n")
     put_text(f"{RESULT_PREFIX}/equity.csv", equity_df.to_csv(index=False) if not equity_df.empty else "time,equity\n")
     put_text(f"{RESULT_PREFIX}/events.csv", events_df.to_csv(index=False) if not events_df.empty else "time,equity,event,ticker,trade_id,reason\n")
+    put_text(f"{RESULT_PREFIX}/diag.csv", diag_df.to_csv(index=False) if not diag_df.empty else "ticker,rows,impulses,impulse_recent_days\n")
 
-    # Plot equity
     plt.figure()
     if not equity_df.empty:
         plt.plot(pd.to_datetime(equity_df["time"]), equity_df["equity"])
         plt.xticks(rotation=30, ha="right")
-        plt.title("POOS Daily Equity (Market-Gated)")
+        plt.title("POOS Daily Equity (Market-Gated, impulse-memory)")
         plt.tight_layout()
     else:
         plt.text(0.5, 0.5, "No trades", ha="center", va="center")
