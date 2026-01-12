@@ -1,1 +1,2 @@
-worker: python src/download.py
+worker: python src/build_universe.py
+
