@@ -1,11 +1,8 @@
-# --- отличия от предыдущей версии ---
-# 1) добавлен IMPULSE_MEMORY_DAYS (по умолчанию 7)
-# 2) watch стартует по impulse_recent, а не только в день импульса
-# 3) сохраняем диагностику: сколько импульсов и сколько из них в risk_on
-
-import os, io, json
-import pandas as pd
+import os
+import io
+import json
 import numpy as np
+import pandas as pd
 import boto3
 from botocore.config import Config
 from dotenv import load_dotenv
@@ -16,6 +13,7 @@ import matplotlib.pyplot as plt
 
 load_dotenv()
 
+# ---------------- R2 ----------------
 R2_ENDPOINT = os.environ["R2_ENDPOINT"]
 R2_KEY = os.environ["R2_ACCESS_KEY_ID"]
 R2_SECRET = os.environ["R2_SECRET_ACCESS_KEY"]
@@ -24,38 +22,52 @@ R2_BUCKET = os.environ["R2_BUCKET"]
 DATA_PREFIX = os.getenv("DATA_PREFIX", "yahoo/1d/")
 MARKET_STATE_KEY = os.getenv("MARKET_STATE_KEY", "results/poos_market_engine_v1/market_state.csv")
 
-IMP_LOOKBACK_DAYS = int(os.getenv("IMP_LOOKBACK_DAYS", "20"))
-IMP_MIN_RET = float(os.getenv("IMP_MIN_RET", "0.30"))
-VOL_MA_DAYS = int(os.getenv("VOL_MA_DAYS", "20"))
-VOL_MULT = float(os.getenv("VOL_MULT", "2.0"))
+RESULT_PREFIX = os.getenv("RESULT_PREFIX", "results/poos_daily_pooslike_v3")
 
-# ВАЖНО: память импульса
-IMPULSE_MEMORY_DAYS = int(os.getenv("IMPULSE_MEMORY_DAYS", "7"))
+# ---------------- Costs ----------------
+SLIPPAGE_BPS   = float(os.getenv("SLIPPAGE_BPS", "5"))
+COMMISSION_BPS = float(os.getenv("COMMISSION_BPS", "1"))
 
-USE_TREND_FILTER = os.getenv("USE_TREND_FILTER", "1") == "1"
-ENTRY_EMA = int(os.getenv("ENTRY_EMA", "20"))
-
-ATR_PERIOD = int(os.getenv("ATR_PERIOD", "14"))
-STOP_ATR = float(os.getenv("STOP_ATR", "1.0"))
-TP_ATR = float(os.getenv("TP_ATR", "1.5"))
-MOVE_BE_PCT = float(os.getenv("MOVE_BE_PCT", "0.01"))
-
-MAX_HOLD_DAYS = int(os.getenv("MAX_HOLD_DAYS", "15"))
-COOLOFF_DAYS = int(os.getenv("COOLOFF_DAYS", "10"))
-TAIL_DAYS = int(os.getenv("TAIL_DAYS", "504"))
-
+# ---------------- Portfolio ----------------
 MAX_POSITIONS = int(os.getenv("MAX_POSITIONS", "40"))
 CAPITAL_UTIL  = float(os.getenv("CAPITAL_UTIL", "0.75"))
 POS_FRACTION  = float(os.getenv("POS_FRACTION", "")) if os.getenv("POS_FRACTION") else (CAPITAL_UTIL / MAX_POSITIONS)
 
-SLIPPAGE_BPS   = float(os.getenv("SLIPPAGE_BPS", "5"))
-COMMISSION_BPS = float(os.getenv("COMMISSION_BPS", "1"))
-
-ALLOW_ENTRY_STATES = [s.strip() for s in os.getenv("ALLOW_ENTRY_STATES", "risk_on").split(",") if s.strip()]
+# ---------------- Market gating ----------------
+ALLOW_ENTRY_STATES = [s.strip() for s in os.getenv("ALLOW_ENTRY_STATES", "risk_on,neutral").split(",") if s.strip()]
 FORCE_EXIT_STATES  = [s.strip() for s in os.getenv("FORCE_EXIT_STATES", "risk_off").split(",") if s.strip()]
 
-RESULT_PREFIX = os.getenv("RESULT_PREFIX", "results/poos_daily_v2_market_gated")
+# ---------------- POOS-like setup ----------------
+# A) Impulse definition (POOS-like): 1-2 day burst + volume
+IMPULSE_RET1_MIN = float(os.getenv("IMPULSE_RET1_MIN", "0.06"))   # 1d > 6%
+IMPULSE_RET2_MIN = float(os.getenv("IMPULSE_RET2_MIN", "0.10"))   # 2d > 10%
+VOL_MA_DAYS      = int(os.getenv("VOL_MA_DAYS", "20"))
+VOL_MULT_IMP     = float(os.getenv("VOL_MULT_IMP", "1.5"))        # impulse volume > 1.5x MA
 
+# B) Memory: after impulse, we can enter within next N days
+IMPULSE_MEMORY_DAYS = int(os.getenv("IMPULSE_MEMORY_DAYS", "14"))
+
+# C) Consolidation / tightness before entry (POOS-like "tight")
+CONS_LOOKBACK = int(os.getenv("CONS_LOOKBACK", "5"))
+CONS_MAX_RANGE_PCT = float(os.getenv("CONS_MAX_RANGE_PCT", "0.08"))  # 8% range over 5 days
+
+# D) Trend filter (daily growth style)
+USE_TREND_FILTER = os.getenv("USE_TREND_FILTER", "1") == "1"
+
+# E) Entry & risk management
+ENTRY_EMA = int(os.getenv("ENTRY_EMA", "20"))   # pullback to EMA20
+ATR_PERIOD = int(os.getenv("ATR_PERIOD", "14"))
+STOP_ATR = float(os.getenv("STOP_ATR", "1.0"))
+TP_ATR   = float(os.getenv("TP_ATR", "1.5"))
+MOVE_BE_PCT = float(os.getenv("MOVE_BE_PCT", "0.01"))
+
+MAX_HOLD_DAYS = int(os.getenv("MAX_HOLD_DAYS", "15"))
+COOLOFF_DAYS  = int(os.getenv("COOLOFF_DAYS", "10"))
+
+# Use last N days of daily bars (2y ~ 504)
+TAIL_DAYS = int(os.getenv("TAIL_DAYS", "504"))
+
+# ---------------- R2 client ----------------
 s3 = boto3.client(
     "s3",
     endpoint_url=R2_ENDPOINT,
@@ -122,7 +134,14 @@ def load_market_state() -> pd.DataFrame:
     ms["d"] = ms["date"].dt.normalize()
     return ms[["date","d","market_state","market_score"]].sort_values("date")
 
-def generate_trades(df: pd.DataFrame, ticker: str, ms_map: dict) -> tuple[pd.DataFrame, dict]:
+def compute_consolidation(df: pd.DataFrame) -> pd.Series:
+    # range% over last CONS_LOOKBACK bars: (max(high)-min(low))/last_close
+    roll_hi = df["high"].rolling(CONS_LOOKBACK, min_periods=CONS_LOOKBACK).max()
+    roll_lo = df["low"].rolling(CONS_LOOKBACK, min_periods=CONS_LOOKBACK).min()
+    rng = (roll_hi - roll_lo) / df["close"]
+    return rng
+
+def generate_trades(df: pd.DataFrame, ticker: str, ms_map: dict):
     df = df.sort_values("date").dropna(subset=["open","high","low","close","volume"]).copy()
     df["date"] = pd.to_datetime(df["date"], utc=True)
 
@@ -135,24 +154,32 @@ def generate_trades(df: pd.DataFrame, ticker: str, ms_map: dict) -> tuple[pd.Dat
     df["atr"]    = atr(df, ATR_PERIOD)
     df["vol_ma"] = df["volume"].rolling(VOL_MA_DAYS, min_periods=VOL_MA_DAYS).mean()
 
-    df["imp_ret"] = df["close"] / df["close"].shift(IMP_LOOKBACK_DAYS) - 1.0
-    df["vol_ok"] = df["volume"] > (VOL_MULT * df["vol_ma"])
+    df["ret1"] = df["close"].pct_change(1)
+    df["ret2"] = df["close"].pct_change(2)
 
+    # POOS-like impulse: burst + volume confirmation
+    df["is_impulse"] = (
+        ((df["ret1"] >= IMPULSE_RET1_MIN) | (df["ret2"] >= IMPULSE_RET2_MIN))
+        & (df["volume"] >= (VOL_MULT_IMP * df["vol_ma"]))
+    ).astype(int)
+
+    # Memory window after impulse
+    df["impulse_recent"] = (
+        df["is_impulse"].rolling(IMPULSE_MEMORY_DAYS, min_periods=1).max().fillna(0).astype(int)
+    )
+
+    # Consolidation / tightness
+    df["cons_range_pct"] = compute_consolidation(df)
+    df["is_tight"] = (df["cons_range_pct"] <= CONS_MAX_RANGE_PCT).astype(int)
+
+    # Trend filter (growth market)
     if USE_TREND_FILTER:
         df["trend_ok"] = (df["close"] > df["ema20"]) & (df["close"] > df["ema50"]) & (df["close"] > df["ema200"])
     else:
         df["trend_ok"] = True
 
-    df["is_impulse"] = (df["imp_ret"] >= IMP_MIN_RET) & df["vol_ok"] & df["trend_ok"]
-
-    # ✅ POOS memory: импульс был недавно
-    df["impulse_recent"] = (
-        df["is_impulse"]
-        .rolling(IMPULSE_MEMORY_DAYS, min_periods=1)
-        .max()
-        .fillna(0)
-        .astype(int)
-    )
+    # Entry EMA
+    ema_col = "ema20" if ENTRY_EMA == 20 else "ema20"
 
     in_pos = False
     watch = False
@@ -167,11 +194,13 @@ def generate_trades(df: pd.DataFrame, ticker: str, ms_map: dict) -> tuple[pd.Dat
 
     trades = []
 
-    # diagnostics
     diag = {
+        "ticker": ticker,
         "rows": int(len(df)),
         "impulses": int(df["is_impulse"].sum()),
-        "impulse_recent_days": int(df["impulse_recent"].sum())
+        "impulse_recent_days": int(df["impulse_recent"].sum()),
+        "tight_days": int(df["is_tight"].sum()),
+        "trend_ok_days": int(pd.Series(df["trend_ok"]).sum()),
     }
 
     for i in range(len(df)):
@@ -184,6 +213,7 @@ def generate_trades(df: pd.DataFrame, ticker: str, ms_map: dict) -> tuple[pd.Dat
 
         mstate = ms_map.get(d, "neutral")
 
+        # ---------------- manage open position ----------------
         if in_pos:
             hold += 1
             lo, hi = float(row["low"]), float(row["high"])
@@ -192,15 +222,22 @@ def generate_trades(df: pd.DataFrame, ticker: str, ms_map: dict) -> tuple[pd.Dat
                 stop = entry
                 be_moved = True
 
+            # Standard exits
             if lo <= stop:
                 exit_px = stop
                 trades.append({
-                    "ticker": ticker, "entry_time": entry_time, "exit_time": t,
-                    "entry": float(entry), "exit": float(exit_px),
-                    "stop_init": float(initial_stop), "tp": float(tp),
-                    "exit_reason": "STOP", "hold_days": int(hold),
-                    "be_moved": bool(be_moved), "score": float(watch_score) if watch_score else np.nan,
-                    "entry_market_state": entry_mstate
+                    "ticker": ticker,
+                    "entry_time": entry_time,
+                    "exit_time": t,
+                    "entry": float(entry),
+                    "exit": float(exit_px),
+                    "stop_init": float(initial_stop),
+                    "tp": float(tp),
+                    "exit_reason": "STOP",
+                    "hold_days": int(hold),
+                    "be_moved": bool(be_moved),
+                    "score": float(watch_score) if watch_score is not None else np.nan,
+                    "entry_market_state": entry_mstate,
                 })
                 in_pos = False
                 cooldown_until = i + COOLOFF_DAYS
@@ -209,12 +246,18 @@ def generate_trades(df: pd.DataFrame, ticker: str, ms_map: dict) -> tuple[pd.Dat
             if hi >= tp:
                 exit_px = tp
                 trades.append({
-                    "ticker": ticker, "entry_time": entry_time, "exit_time": t,
-                    "entry": float(entry), "exit": float(exit_px),
-                    "stop_init": float(initial_stop), "tp": float(tp),
-                    "exit_reason": "TP", "hold_days": int(hold),
-                    "be_moved": bool(be_moved), "score": float(watch_score) if watch_score else np.nan,
-                    "entry_market_state": entry_mstate
+                    "ticker": ticker,
+                    "entry_time": entry_time,
+                    "exit_time": t,
+                    "entry": float(entry),
+                    "exit": float(exit_px),
+                    "stop_init": float(initial_stop),
+                    "tp": float(tp),
+                    "exit_reason": "TP",
+                    "hold_days": int(hold),
+                    "be_moved": bool(be_moved),
+                    "score": float(watch_score) if watch_score is not None else np.nan,
+                    "entry_market_state": entry_mstate,
                 })
                 in_pos = False
                 cooldown_until = i + COOLOFF_DAYS
@@ -223,47 +266,66 @@ def generate_trades(df: pd.DataFrame, ticker: str, ms_map: dict) -> tuple[pd.Dat
             if hold >= MAX_HOLD_DAYS:
                 exit_px = float(row["close"])
                 trades.append({
-                    "ticker": ticker, "entry_time": entry_time, "exit_time": t,
-                    "entry": float(entry), "exit": float(exit_px),
-                    "stop_init": float(initial_stop), "tp": float(tp),
-                    "exit_reason": "TIME", "hold_days": int(hold),
-                    "be_moved": bool(be_moved), "score": float(watch_score) if watch_score else np.nan,
-                    "entry_market_state": entry_mstate
+                    "ticker": ticker,
+                    "entry_time": entry_time,
+                    "exit_time": t,
+                    "entry": float(entry),
+                    "exit": float(exit_px),
+                    "stop_init": float(initial_stop),
+                    "tp": float(tp),
+                    "exit_reason": "TIME",
+                    "hold_days": int(hold),
+                    "be_moved": bool(be_moved),
+                    "score": float(watch_score) if watch_score is not None else np.nan,
+                    "entry_market_state": entry_mstate,
                 })
                 in_pos = False
                 cooldown_until = i + COOLOFF_DAYS
                 continue
 
+        # ---------------- find new entry ----------------
         if not in_pos:
             if not watch:
-                # ✅ ВАЖНО: watch можно начать, если импульс был недавно, а рынок сейчас risk_on
-                if (mstate in ALLOW_ENTRY_STATES) and bool(row["impulse_recent"]):
+                # Start watch only when market allows entries AND we had recent impulse AND trend ok
+                if (mstate in ALLOW_ENTRY_STATES) and bool(row["impulse_recent"]) and bool(row["trend_ok"]):
+                    # Score: combine burst strength + volume multiple (more POOS-like)
                     vol_ratio = float(row["volume"] / row["vol_ma"]) if row["vol_ma"] and not pd.isna(row["vol_ma"]) else 0.0
-                    watch_score = float(row["imp_ret"]) * vol_ratio
+                    burst = max(float(row["ret1"]) if not pd.isna(row["ret1"]) else 0.0,
+                                float(row["ret2"]) if not pd.isna(row["ret2"]) else 0.0)
+                    watch_score = float(burst) * float(vol_ratio)
                     watch = True
             else:
+                # If market no longer allows entries, stop watching
                 if mstate not in ALLOW_ENTRY_STATES:
                     watch = False
                     watch_score = None
                     continue
 
+                # If trend breaks, stop watching
                 if USE_TREND_FILTER and (not bool(row["trend_ok"])):
                     watch = False
                     watch_score = None
                     continue
 
+                # Require tight consolidation before pullback entry (POOS-style)
+                if not bool(row["is_tight"]):
+                    continue
+
                 a = row["atr"]
-                e = row["ema20"]
+                e = row[ema_col]
                 if pd.isna(a) or pd.isna(e):
                     continue
 
+                # Entry: pullback tag EMA20 (touch)
                 if float(row["low"]) <= float(e):
                     entry = float(e)
                     entry_time = t
                     entry_mstate = mstate
+
                     initial_stop = entry - STOP_ATR * float(a)
                     stop = initial_stop
                     tp = entry + TP_ATR * float(a)
+
                     in_pos = True
                     watch = False
                     be_moved = False
@@ -286,6 +348,7 @@ def simulate_portfolio(trades: pd.DataFrame, market_state: pd.DataFrame):
     start = trades["entry_time"].min().normalize()
     end = trades["exit_time"].max().normalize()
 
+    # Need daily closes for market exits
     close_map = {}
     for t in tickers:
         try:
@@ -323,19 +386,23 @@ def simulate_portfolio(trades: pd.DataFrame, market_state: pd.DataFrame):
         for tid in sorted(to_close, key=lambda x: open_pos[x]["close_time"]):
             pos = open_pos.pop(tid)
             px_close = close_map.get((pos["ticker"], d_norm), pos["planned_exit_px"])
+
             entry_adj, exit_adj = apply_costs(pos["entry_px"], float(px_close))
             ret = (exit_adj / entry_adj) - 1.0
+
             equity *= (1.0 + pos["pos_frac"] * ret)
             events.append((close_time, equity, "FORCE_EXIT", pos["ticker"], tid, "MARKET_RISK_OFF"))
 
     for et in entry_times:
         close_positions_by_time(et)
+
         d_et = pd.to_datetime(et, utc=True).normalize()
         force_exit_on_day(d_et, et)
 
         free_slots = MAX_POSITIONS - len(open_pos)
         if free_slots <= 0:
             continue
+
         used_frac = sum(p["pos_frac"] for p in open_pos.values())
         free_frac = max(0.0, CAPITAL_UTIL - used_frac)
         if free_frac <= 0:
@@ -344,6 +411,7 @@ def simulate_portfolio(trades: pd.DataFrame, market_state: pd.DataFrame):
         batch = trades[trades["entry_time"] == et].copy()
         if batch.empty:
             continue
+
         max_by_frac = int(free_frac / POS_FRACTION) if POS_FRACTION > 0 else 0
         can_open = max(0, min(free_slots, max_by_frac))
         if can_open <= 0:
@@ -354,6 +422,7 @@ def simulate_portfolio(trades: pd.DataFrame, market_state: pd.DataFrame):
         for _, r in batch.iterrows():
             entry_px = float(r["entry"])
             planned_exit_px = float(r["exit"])
+
             entry_adj, exit_adj = apply_costs(entry_px, planned_exit_px)
             planned_ret = (exit_adj / entry_adj) - 1.0
 
@@ -378,11 +447,21 @@ def simulate_portfolio(trades: pd.DataFrame, market_state: pd.DataFrame):
     return equity_df, events_df
 
 def main():
+    # Load market state
     ms = load_market_state()
     ms_map = dict(zip(ms["d"], ms["market_state"]))
 
-    tickers = [t for t in list_tickers(DATA_PREFIX)]
+    tickers = list_tickers(DATA_PREFIX)
+
     print("Tickers:", len(tickers))
+    print("ENV CHECK:",
+          "IMPULSE_RET1_MIN", IMPULSE_RET1_MIN,
+          "IMPULSE_RET2_MIN", IMPULSE_RET2_MIN,
+          "VOL_MULT_IMP", VOL_MULT_IMP,
+          "IMPULSE_MEMORY_DAYS", IMPULSE_MEMORY_DAYS,
+          "CONS_MAX_RANGE_PCT", CONS_MAX_RANGE_PCT,
+          "ALLOW_ENTRY_STATES", ALLOW_ENTRY_STATES,
+          "TAIL_DAYS", TAIL_DAYS)
 
     all_trades = []
     diags = []
@@ -392,13 +471,15 @@ def main():
             df = read_parquet(f"{DATA_PREFIX}{t}.parquet")
             if df is None or df.empty:
                 continue
+
             tr, diag = generate_trades(df, t, ms_map)
-            diag["ticker"] = t
             diags.append(diag)
             if not tr.empty:
                 all_trades.append(tr)
+
             if i % 50 == 0:
                 print(f"Processed {i}/{len(tickers)}")
+
         except Exception as e:
             print("Error:", t, e)
 
@@ -407,35 +488,72 @@ def main():
 
     equity_df, events_df = simulate_portfolio(trades, ms)
 
+    env_debug = {
+        "IMPULSE_RET1_MIN": os.getenv("IMPULSE_RET1_MIN"),
+        "IMPULSE_RET2_MIN": os.getenv("IMPULSE_RET2_MIN"),
+        "VOL_MULT_IMP": os.getenv("VOL_MULT_IMP"),
+        "IMPULSE_MEMORY_DAYS": os.getenv("IMPULSE_MEMORY_DAYS"),
+        "CONS_LOOKBACK": os.getenv("CONS_LOOKBACK"),
+        "CONS_MAX_RANGE_PCT": os.getenv("CONS_MAX_RANGE_PCT"),
+        "ALLOW_ENTRY_STATES": os.getenv("ALLOW_ENTRY_STATES"),
+        "FORCE_EXIT_STATES": os.getenv("FORCE_EXIT_STATES"),
+        "MAX_POSITIONS": os.getenv("MAX_POSITIONS"),
+        "CAPITAL_UTIL": os.getenv("CAPITAL_UTIL"),
+        "POS_FRACTION": os.getenv("POS_FRACTION"),
+        "TAIL_DAYS": os.getenv("TAIL_DAYS"),
+        "MARKET_STATE_KEY": os.getenv("MARKET_STATE_KEY"),
+    }
+
     stats = {
-        "mode": "POOS DAILY + MARKET ENGINE GATING (impulse memory fixed)",
+        "mode": "POOS DAILY (POOS-like impulse+consolidation) + MARKET ENGINE GATING",
         "tickers_tested": int(len(tickers)),
         "trades": int(len(trades)) if not trades.empty else 0,
         "final_equity": float(equity_df["equity"].iloc[-1]) if not equity_df.empty else 1.0,
-        "impulse_memory_days": int(IMPULSE_MEMORY_DAYS),
+        "max_positions": int(MAX_POSITIONS),
+        "capital_util": float(CAPITAL_UTIL),
+        "pos_fraction": float(POS_FRACTION),
+        "slippage_bps_per_side": float(SLIPPAGE_BPS),
+        "commission_bps_per_side": float(COMMISSION_BPS),
         "allow_entry_states": ALLOW_ENTRY_STATES,
         "force_exit_states": FORCE_EXIT_STATES,
-        "imp_lookback_days": int(IMP_LOOKBACK_DAYS),
-        "imp_min_ret": float(IMP_MIN_RET),
-        "vol_mult": float(VOL_MULT),
+        "setup_params": {
+            "impulse_ret1_min": float(IMPULSE_RET1_MIN),
+            "impulse_ret2_min": float(IMPULSE_RET2_MIN),
+            "vol_mult_imp": float(VOL_MULT_IMP),
+            "impulse_memory_days": int(IMPULSE_MEMORY_DAYS),
+            "cons_lookback": int(CONS_LOOKBACK),
+            "cons_max_range_pct": float(CONS_MAX_RANGE_PCT),
+            "use_trend_filter": bool(USE_TREND_FILTER),
+            "entry_ema": int(ENTRY_EMA),
+            "atr_period": int(ATR_PERIOD),
+            "stop_atr": float(STOP_ATR),
+            "tp_atr": float(TP_ATR),
+            "move_be_pct": float(MOVE_BE_PCT),
+            "max_hold_days": int(MAX_HOLD_DAYS),
+            "cooloff_days": int(COOLOFF_DAYS),
+            "tail_days": int(TAIL_DAYS),
+        },
         "market_state_counts": ms["market_state"].value_counts().to_dict(),
-        "impulse_diag_sum": {
+        "diag_sum": {
             "impulses_total": int(diag_df["impulses"].sum()) if not diag_df.empty else 0,
             "impulse_recent_days_total": int(diag_df["impulse_recent_days"].sum()) if not diag_df.empty else 0,
-        }
+            "tight_days_total": int(diag_df["tight_days"].sum()) if not diag_df.empty else 0,
+        },
+        "env_debug": env_debug,
     }
 
     put_text(f"{RESULT_PREFIX}/stats.json", json.dumps(stats, indent=2))
     put_text(f"{RESULT_PREFIX}/trades.csv", trades.to_csv(index=False) if not trades.empty else "ticker,entry_time,exit_time,entry,exit,stop_init,tp,exit_reason,hold_days,be_moved,score,entry_market_state\n")
     put_text(f"{RESULT_PREFIX}/equity.csv", equity_df.to_csv(index=False) if not equity_df.empty else "time,equity\n")
     put_text(f"{RESULT_PREFIX}/events.csv", events_df.to_csv(index=False) if not events_df.empty else "time,equity,event,ticker,trade_id,reason\n")
-    put_text(f"{RESULT_PREFIX}/diag.csv", diag_df.to_csv(index=False) if not diag_df.empty else "ticker,rows,impulses,impulse_recent_days\n")
+    put_text(f"{RESULT_PREFIX}/diag.csv", diag_df.to_csv(index=False) if not diag_df.empty else "ticker,rows,impulses,impulse_recent_days,tight_days,trend_ok_days\n")
 
+    # Plot equity
     plt.figure()
     if not equity_df.empty:
         plt.plot(pd.to_datetime(equity_df["time"]), equity_df["equity"])
         plt.xticks(rotation=30, ha="right")
-        plt.title("POOS Daily Equity (Market-Gated, impulse-memory)")
+        plt.title("POOS Daily Equity (POOS-like, market-gated)")
         plt.tight_layout()
     else:
         plt.text(0.5, 0.5, "No trades", ha="center", va="center")
