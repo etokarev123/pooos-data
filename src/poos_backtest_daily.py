@@ -21,50 +21,62 @@ R2_BUCKET = os.environ["R2_BUCKET"]
 
 DATA_PREFIX = os.getenv("DATA_PREFIX", "yahoo/1d/")
 MARKET_STATE_KEY = os.getenv("MARKET_STATE_KEY", "results/poos_market_engine_v1/market_state.csv")
-
-RESULT_PREFIX = os.getenv("RESULT_PREFIX", "results/poos_daily_pooslike_v3")
+RESULT_PREFIX = os.getenv("RESULT_PREFIX", "results/poos_daily_pooslike_v4_trailing")
 
 # ---------------- Costs ----------------
 SLIPPAGE_BPS   = float(os.getenv("SLIPPAGE_BPS", "5"))
 COMMISSION_BPS = float(os.getenv("COMMISSION_BPS", "1"))
 
 # ---------------- Portfolio ----------------
-MAX_POSITIONS = int(os.getenv("MAX_POSITIONS", "40"))
-CAPITAL_UTIL  = float(os.getenv("CAPITAL_UTIL", "0.75"))
-POS_FRACTION  = float(os.getenv("POS_FRACTION", "")) if os.getenv("POS_FRACTION") else (CAPITAL_UTIL / MAX_POSITIONS)
+MAX_POSITIONS = int(os.getenv("MAX_POSITIONS", "75"))
+CAPITAL_UTIL  = float(os.getenv("CAPITAL_UTIL", "1.50"))
+POS_FRACTION  = float(os.getenv("POS_FRACTION", "0.03")) if os.getenv("POS_FRACTION") else (CAPITAL_UTIL / MAX_POSITIONS)
 
 # ---------------- Market gating ----------------
 ALLOW_ENTRY_STATES = [s.strip() for s in os.getenv("ALLOW_ENTRY_STATES", "risk_on,neutral").split(",") if s.strip()]
 FORCE_EXIT_STATES  = [s.strip() for s in os.getenv("FORCE_EXIT_STATES", "risk_off").split(",") if s.strip()]
 
 # ---------------- POOS-like setup ----------------
-# A) Impulse definition (POOS-like): 1-2 day burst + volume
-IMPULSE_RET1_MIN = float(os.getenv("IMPULSE_RET1_MIN", "0.06"))   # 1d > 6%
-IMPULSE_RET2_MIN = float(os.getenv("IMPULSE_RET2_MIN", "0.10"))   # 2d > 10%
+# Impulse: 1-2 day burst + volume
+IMPULSE_RET1_MIN = float(os.getenv("IMPULSE_RET1_MIN", "0.04"))
+IMPULSE_RET2_MIN = float(os.getenv("IMPULSE_RET2_MIN", "0.07"))
 VOL_MA_DAYS      = int(os.getenv("VOL_MA_DAYS", "20"))
-VOL_MULT_IMP     = float(os.getenv("VOL_MULT_IMP", "1.5"))        # impulse volume > 1.5x MA
+VOL_MULT_IMP     = float(os.getenv("VOL_MULT_IMP", "1.2"))
 
-# B) Memory: after impulse, we can enter within next N days
-IMPULSE_MEMORY_DAYS = int(os.getenv("IMPULSE_MEMORY_DAYS", "14"))
+# Memory after impulse
+IMPULSE_MEMORY_DAYS = int(os.getenv("IMPULSE_MEMORY_DAYS", "21"))
 
-# C) Consolidation / tightness before entry (POOS-like "tight")
+# Consolidation / tightness
 CONS_LOOKBACK = int(os.getenv("CONS_LOOKBACK", "5"))
-CONS_MAX_RANGE_PCT = float(os.getenv("CONS_MAX_RANGE_PCT", "0.08"))  # 8% range over 5 days
+CONS_MAX_RANGE_PCT = float(os.getenv("CONS_MAX_RANGE_PCT", "0.12"))
 
-# D) Trend filter (daily growth style)
+# Trend filter
 USE_TREND_FILTER = os.getenv("USE_TREND_FILTER", "1") == "1"
 
-# E) Entry & risk management
-ENTRY_EMA = int(os.getenv("ENTRY_EMA", "20"))   # pullback to EMA20
+# Entry & risk
+ENTRY_EMA = int(os.getenv("ENTRY_EMA", "20"))   # currently EMA20
 ATR_PERIOD = int(os.getenv("ATR_PERIOD", "14"))
-STOP_ATR = float(os.getenv("STOP_ATR", "1.0"))
-TP_ATR   = float(os.getenv("TP_ATR", "1.5"))
+
+# We keep initial risk stop wide-ish, winners will be trailed
+STOP_ATR = float(os.getenv("STOP_ATR", "1.2"))
+
+# Hard TP is optional (we will mostly rely on trailing). If you want "no TP", set VERY HIGH.
+TP_ATR = float(os.getenv("TP_ATR", "8.0"))
+
 MOVE_BE_PCT = float(os.getenv("MOVE_BE_PCT", "0.01"))
 
-MAX_HOLD_DAYS = int(os.getenv("MAX_HOLD_DAYS", "15"))
+# Trailing config
+TRAIL_MODE = os.getenv("TRAIL_MODE", "ema_atr")  # "ema_atr" or "close_atr"
+TRAIL_ATR_MULT = float(os.getenv("TRAIL_ATR_MULT", "1.8"))  # how tight the trail is after BE
+
+# Partial take-profit (optional)
+ENABLE_PARTIAL_TP = os.getenv("ENABLE_PARTIAL_TP", "1") == "1"
+PARTIAL_TP_R = float(os.getenv("PARTIAL_TP_R", "2.0"))        # take some at 2R
+PARTIAL_FRACTION = float(os.getenv("PARTIAL_FRACTION", "0.50"))  # take 50% off
+
+MAX_HOLD_DAYS = int(os.getenv("MAX_HOLD_DAYS", "30"))
 COOLOFF_DAYS  = int(os.getenv("COOLOFF_DAYS", "10"))
 
-# Use last N days of daily bars (2y ~ 504)
 TAIL_DAYS = int(os.getenv("TAIL_DAYS", "504"))
 
 # ---------------- R2 client ----------------
@@ -135,7 +147,6 @@ def load_market_state() -> pd.DataFrame:
     return ms[["date","d","market_state","market_score"]].sort_values("date")
 
 def compute_consolidation(df: pd.DataFrame) -> pd.Series:
-    # range% over last CONS_LOOKBACK bars: (max(high)-min(low))/last_close
     roll_hi = df["high"].rolling(CONS_LOOKBACK, min_periods=CONS_LOOKBACK).max()
     roll_lo = df["low"].rolling(CONS_LOOKBACK, min_periods=CONS_LOOKBACK).min()
     rng = (roll_hi - roll_lo) / df["close"]
@@ -157,40 +168,46 @@ def generate_trades(df: pd.DataFrame, ticker: str, ms_map: dict):
     df["ret1"] = df["close"].pct_change(1)
     df["ret2"] = df["close"].pct_change(2)
 
-    # POOS-like impulse: burst + volume confirmation
     df["is_impulse"] = (
         ((df["ret1"] >= IMPULSE_RET1_MIN) | (df["ret2"] >= IMPULSE_RET2_MIN))
         & (df["volume"] >= (VOL_MULT_IMP * df["vol_ma"]))
     ).astype(int)
 
-    # Memory window after impulse
     df["impulse_recent"] = (
         df["is_impulse"].rolling(IMPULSE_MEMORY_DAYS, min_periods=1).max().fillna(0).astype(int)
     )
 
-    # Consolidation / tightness
     df["cons_range_pct"] = compute_consolidation(df)
     df["is_tight"] = (df["cons_range_pct"] <= CONS_MAX_RANGE_PCT).astype(int)
 
-    # Trend filter (growth market)
     if USE_TREND_FILTER:
         df["trend_ok"] = (df["close"] > df["ema20"]) & (df["close"] > df["ema50"]) & (df["close"] > df["ema200"])
     else:
         df["trend_ok"] = True
 
-    # Entry EMA
-    ema_col = "ema20" if ENTRY_EMA == 20 else "ema20"
+    ema_col = "ema20"  # currently only EMA20 entry
 
-    in_pos = False
     watch = False
     cooldown_until = -1
 
-    entry = stop = tp = initial_stop = None
-    be_moved = False
-    hold = 0
+    # Position state for per-ticker simulation
+    in_pos = False
+    entry = None
     entry_time = None
     entry_mstate = None
+
+    initial_stop = None
+    stop = None
+    tp = None
+
+    be_moved = False
+    hold = 0
     watch_score = None
+
+    # partial TP state
+    partial_done = False
+    partial_px = None
+    r_unit = None  # entry - initial_stop
 
     trades = []
 
@@ -200,7 +217,6 @@ def generate_trades(df: pd.DataFrame, ticker: str, ms_map: dict):
         "impulses": int(df["is_impulse"].sum()),
         "impulse_recent_days": int(df["impulse_recent"].sum()),
         "tight_days": int(df["is_tight"].sum()),
-        "trend_ok_days": int(pd.Series(df["trend_ok"]).sum()),
     }
 
     for i in range(len(df)):
@@ -216,69 +232,108 @@ def generate_trades(df: pd.DataFrame, ticker: str, ms_map: dict):
         # ---------------- manage open position ----------------
         if in_pos:
             hold += 1
-            lo, hi = float(row["low"]), float(row["high"])
+            lo, hi, cl = float(row["low"]), float(row["high"]), float(row["close"])
 
+            # move to BE once price moves +MOVE_BE_PCT in our favor
             if (not be_moved) and hi >= entry * (1.0 + MOVE_BE_PCT):
-                stop = entry
+                stop = max(stop, entry)
                 be_moved = True
 
-            # Standard exits
+            # after BE, trail stop (POOS-like: let winners run)
+            if be_moved:
+                a = row["atr"]
+                e = row["ema20"]
+                if not pd.isna(a) and not pd.isna(e):
+                    if TRAIL_MODE == "ema_atr":
+                        trail = float(e) - TRAIL_ATR_MULT * float(a)
+                    else:
+                        trail = float(cl) - TRAIL_ATR_MULT * float(a)
+                    stop = max(stop, trail)
+
+            # Partial TP (take some off at PARTIAL_TP_R * R)
+            if ENABLE_PARTIAL_TP and (not partial_done) and (r_unit is not None) and (r_unit > 0):
+                target_partial = entry + PARTIAL_TP_R * r_unit
+                if hi >= target_partial:
+                    partial_done = True
+                    partial_px = target_partial
+                    # record partial trade as separate trade with size_mult = PARTIAL_FRACTION
+                    trades.append({
+                        "ticker": ticker,
+                        "entry_time": entry_time,
+                        "exit_time": t,
+                        "entry": float(entry),
+                        "exit": float(partial_px),
+                        "exit_reason": f"PARTIAL_{PARTIAL_TP_R}R",
+                        "hold_days": int(hold),
+                        "be_moved": bool(be_moved),
+                        "score": float(watch_score) if watch_score is not None else np.nan,
+                        "entry_market_state": entry_mstate,
+                        "size_mult": float(PARTIAL_FRACTION),
+                    })
+
+            # Hard TP (usually very far if you want trailing)
+            if tp is not None and hi >= tp:
+                exit_px = tp
+                # remaining size
+                rem = 1.0 - (PARTIAL_FRACTION if partial_done else 0.0)
+                if rem > 0:
+                    trades.append({
+                        "ticker": ticker,
+                        "entry_time": entry_time,
+                        "exit_time": t,
+                        "entry": float(entry),
+                        "exit": float(exit_px),
+                        "exit_reason": "TP",
+                        "hold_days": int(hold),
+                        "be_moved": bool(be_moved),
+                        "score": float(watch_score) if watch_score is not None else np.nan,
+                        "entry_market_state": entry_mstate,
+                        "size_mult": float(rem),
+                    })
+                in_pos = False
+                cooldown_until = i + COOLOFF_DAYS
+                continue
+
+            # Stop hit (includes trailed stop)
             if lo <= stop:
                 exit_px = stop
-                trades.append({
-                    "ticker": ticker,
-                    "entry_time": entry_time,
-                    "exit_time": t,
-                    "entry": float(entry),
-                    "exit": float(exit_px),
-                    "stop_init": float(initial_stop),
-                    "tp": float(tp),
-                    "exit_reason": "STOP",
-                    "hold_days": int(hold),
-                    "be_moved": bool(be_moved),
-                    "score": float(watch_score) if watch_score is not None else np.nan,
-                    "entry_market_state": entry_mstate,
-                })
+                rem = 1.0 - (PARTIAL_FRACTION if partial_done else 0.0)
+                if rem > 0:
+                    trades.append({
+                        "ticker": ticker,
+                        "entry_time": entry_time,
+                        "exit_time": t,
+                        "entry": float(entry),
+                        "exit": float(exit_px),
+                        "exit_reason": "STOP",
+                        "hold_days": int(hold),
+                        "be_moved": bool(be_moved),
+                        "score": float(watch_score) if watch_score is not None else np.nan,
+                        "entry_market_state": entry_mstate,
+                        "size_mult": float(rem),
+                    })
                 in_pos = False
                 cooldown_until = i + COOLOFF_DAYS
                 continue
 
-            if hi >= tp:
-                exit_px = tp
-                trades.append({
-                    "ticker": ticker,
-                    "entry_time": entry_time,
-                    "exit_time": t,
-                    "entry": float(entry),
-                    "exit": float(exit_px),
-                    "stop_init": float(initial_stop),
-                    "tp": float(tp),
-                    "exit_reason": "TP",
-                    "hold_days": int(hold),
-                    "be_moved": bool(be_moved),
-                    "score": float(watch_score) if watch_score is not None else np.nan,
-                    "entry_market_state": entry_mstate,
-                })
-                in_pos = False
-                cooldown_until = i + COOLOFF_DAYS
-                continue
-
+            # Time exit
             if hold >= MAX_HOLD_DAYS:
                 exit_px = float(row["close"])
-                trades.append({
-                    "ticker": ticker,
-                    "entry_time": entry_time,
-                    "exit_time": t,
-                    "entry": float(entry),
-                    "exit": float(exit_px),
-                    "stop_init": float(initial_stop),
-                    "tp": float(tp),
-                    "exit_reason": "TIME",
-                    "hold_days": int(hold),
-                    "be_moved": bool(be_moved),
-                    "score": float(watch_score) if watch_score is not None else np.nan,
-                    "entry_market_state": entry_mstate,
-                })
+                rem = 1.0 - (PARTIAL_FRACTION if partial_done else 0.0)
+                if rem > 0:
+                    trades.append({
+                        "ticker": ticker,
+                        "entry_time": entry_time,
+                        "exit_time": t,
+                        "entry": float(entry),
+                        "exit": float(exit_px),
+                        "exit_reason": "TIME",
+                        "hold_days": int(hold),
+                        "be_moved": bool(be_moved),
+                        "score": float(watch_score) if watch_score is not None else np.nan,
+                        "entry_market_state": entry_mstate,
+                        "size_mult": float(rem),
+                    })
                 in_pos = False
                 cooldown_until = i + COOLOFF_DAYS
                 continue
@@ -286,28 +341,23 @@ def generate_trades(df: pd.DataFrame, ticker: str, ms_map: dict):
         # ---------------- find new entry ----------------
         if not in_pos:
             if not watch:
-                # Start watch only when market allows entries AND we had recent impulse AND trend ok
                 if (mstate in ALLOW_ENTRY_STATES) and bool(row["impulse_recent"]) and bool(row["trend_ok"]):
-                    # Score: combine burst strength + volume multiple (more POOS-like)
                     vol_ratio = float(row["volume"] / row["vol_ma"]) if row["vol_ma"] and not pd.isna(row["vol_ma"]) else 0.0
                     burst = max(float(row["ret1"]) if not pd.isna(row["ret1"]) else 0.0,
                                 float(row["ret2"]) if not pd.isna(row["ret2"]) else 0.0)
                     watch_score = float(burst) * float(vol_ratio)
                     watch = True
             else:
-                # If market no longer allows entries, stop watching
                 if mstate not in ALLOW_ENTRY_STATES:
                     watch = False
                     watch_score = None
                     continue
 
-                # If trend breaks, stop watching
                 if USE_TREND_FILTER and (not bool(row["trend_ok"])):
                     watch = False
                     watch_score = None
                     continue
 
-                # Require tight consolidation before pullback entry (POOS-style)
                 if not bool(row["is_tight"]):
                     continue
 
@@ -316,7 +366,6 @@ def generate_trades(df: pd.DataFrame, ticker: str, ms_map: dict):
                 if pd.isna(a) or pd.isna(e):
                     continue
 
-                # Entry: pullback tag EMA20 (touch)
                 if float(row["low"]) <= float(e):
                     entry = float(e)
                     entry_time = t
@@ -324,169 +373,235 @@ def generate_trades(df: pd.DataFrame, ticker: str, ms_map: dict):
 
                     initial_stop = entry - STOP_ATR * float(a)
                     stop = initial_stop
-                    tp = entry + TP_ATR * float(a)
+                    tp = entry + TP_ATR * float(a) if TP_ATR and TP_ATR > 0 else None
+
+                    be_moved = False
+                    hold = 0
+                    partial_done = False
+                    partial_px = None
+                    r_unit = max(0.0, entry - initial_stop)
 
                     in_pos = True
                     watch = False
-                    be_moved = False
-                    hold = 0
 
     return pd.DataFrame(trades), diag
 
-def simulate_portfolio(trades: pd.DataFrame, market_state: pd.DataFrame):
+# ---------- Portfolio simulator with DAILY mark-to-market ----------
+
+def simulate_portfolio_daily(trades: pd.DataFrame, market_state: pd.DataFrame):
+    """
+    Self-financing-ish simulation with cash + positions.
+    Each opened trade uses notional = POS_FRACTION * size_mult * equity_at_open.
+    Equity is marked daily using daily closes.
+    Forced exit on risk_off at that day's close.
+    """
+
     if trades.empty:
-        return pd.DataFrame(columns=["time","equity"]), pd.DataFrame()
+        return pd.DataFrame(columns=["date","equity"]), pd.DataFrame()
 
     trades = trades.copy()
     trades["entry_time"] = pd.to_datetime(trades["entry_time"], utc=True)
     trades["exit_time"]  = pd.to_datetime(trades["exit_time"], utc=True)
+    if "size_mult" not in trades.columns:
+        trades["size_mult"] = 1.0
+    trades["size_mult"] = pd.to_numeric(trades["size_mult"], errors="coerce").fillna(1.0)
 
+    # Market state map by day
     ms = market_state.copy()
+    ms["d"] = pd.to_datetime(ms["d"], utc=True)
     ms_map = dict(zip(ms["d"], ms["market_state"]))
 
+    # Universe tickers
     tickers = sorted(trades["ticker"].unique().tolist())
-    start = trades["entry_time"].min().normalize()
-    end = trades["exit_time"].max().normalize()
 
-    # Need daily closes for market exits
-    close_map = {}
-    for t in tickers:
+    # Determine calendar range
+    start = min(trades["entry_time"].min().normalize(), trades["exit_time"].min().normalize())
+    end = max(trades["exit_time"].max().normalize(), trades["entry_time"].max().normalize())
+
+    # Load daily closes for tickers used (only in window)
+    closes = []
+    for tkr in tickers:
         try:
-            df = read_parquet(f"{DATA_PREFIX}{t}.parquet")
+            df = read_parquet(f"{DATA_PREFIX}{tkr}.parquet")
             df["date"] = pd.to_datetime(df["date"], utc=True)
             df["d"] = df["date"].dt.normalize()
-            df = df[(df["d"] >= start) & (df["d"] <= end)]
-            close_map.update({(t, d): float(c) for d, c in zip(df["d"], df["close"])})
+            df = df[(df["d"] >= start) & (df["d"] <= end)][["d","close"]].dropna()
+            df["ticker"] = tkr
+            closes.append(df)
         except Exception as e:
-            print("close load err", t, e)
+            print("close load err", tkr, e)
 
+    close_df = pd.concat(closes, ignore_index=True) if closes else pd.DataFrame(columns=["d","close","ticker"])
+    close_df = close_df.rename(columns={"d":"date"})
+    close_pivot = close_df.pivot(index="date", columns="ticker", values="close").sort_index()
+
+    # Build calendar from available close dates (intersection/union)
+    cal = close_pivot.index
+    if len(cal) == 0:
+        return pd.DataFrame(columns=["date","equity"]), pd.DataFrame()
+
+    # Prepare trade lists by day
+    trades["d_entry"] = trades["entry_time"].dt.normalize()
+    trades["d_exit"]  = trades["exit_time"].dt.normalize()
+
+    # Sort for capacity preference (score desc)
     trades["score"] = pd.to_numeric(trades.get("score", 0.0), errors="coerce").fillna(0.0)
     trades = trades.sort_values(["entry_time","score"], ascending=[True, False]).reset_index(drop=True)
     trades["trade_id"] = np.arange(len(trades))
 
-    equity = 1.0
+    entries_by_day = {d: df for d, df in trades.groupby("d_entry")}
+    exits_by_day = {d: df for d, df in trades.groupby("d_exit")}
+
+    # Position book
+    # pos: trade_id -> dict
+    positions = {}
+
+    cash = 1.0
+    equity_curve = []
     events = []
-    open_pos = {}
 
-    entry_times = trades["entry_time"].sort_values().unique()
+    def compute_equity(date):
+        eq = cash
+        if positions:
+            prices = close_pivot.loc[date]
+            for tid, p in positions.items():
+                px = prices.get(p["ticker"], np.nan)
+                if pd.isna(px):
+                    continue
+                # mark-to-market using raw close; costs are applied on entry/exit only
+                eq += p["notional"] * (float(px) / p["entry_px"])
+        return float(eq)
 
-    def close_positions_by_time(tstamp):
-        nonlocal equity
-        to_close = [tid for tid, pos in open_pos.items() if pos["close_time"] <= tstamp]
-        for tid in sorted(to_close, key=lambda tid: open_pos[tid]["close_time"]):
-            pos = open_pos.pop(tid)
-            equity *= (1.0 + pos["pos_frac"] * pos["ret"])
-            events.append((pos["close_time"], equity, "CLOSE", pos["ticker"], tid, pos["close_reason"]))
+    def used_util(current_equity):
+        # approx utilization = sum(notional)/equity
+        notional_sum = sum(p["notional"] for p in positions.values())
+        return (notional_sum / current_equity) if current_equity > 0 else 0.0
 
-    def force_exit_on_day(d_norm, close_time):
-        nonlocal equity
-        if ms_map.get(d_norm, "neutral") not in FORCE_EXIT_STATES:
-            return
-        to_close = list(open_pos.keys())
-        for tid in sorted(to_close, key=lambda x: open_pos[x]["close_time"]):
-            pos = open_pos.pop(tid)
-            px_close = close_map.get((pos["ticker"], d_norm), pos["planned_exit_px"])
+    for d in cal:
+        # 1) mark-to-market equity at start of day close (we will use close-to-close)
+        eq = compute_equity(d)
 
-            entry_adj, exit_adj = apply_costs(pos["entry_px"], float(px_close))
-            ret = (exit_adj / entry_adj) - 1.0
+        # 2) forced exit on risk_off (at this day's close)
+        if ms_map.get(d, "neutral") in FORCE_EXIT_STATES and positions:
+            prices = close_pivot.loc[d]
+            to_close = list(positions.keys())
+            for tid in to_close:
+                p = positions.pop(tid)
+                px = prices.get(p["ticker"], np.nan)
+                if pd.isna(px):
+                    px = p["entry_px"]
+                # apply costs on exit
+                entry_adj, exit_adj = apply_costs(p["entry_px"], float(px))
+                ret = (exit_adj / entry_adj) - 1.0
+                cash += p["notional"] * (1.0 + ret)
+                events.append((pd.Timestamp(d).tz_localize("UTC"), "FORCE_EXIT", p["ticker"], int(tid), "MARKET_RISK_OFF"))
+            eq = compute_equity(d)
 
-            equity *= (1.0 + pos["pos_frac"] * ret)
-            events.append((close_time, equity, "FORCE_EXIT", pos["ticker"], tid, "MARKET_RISK_OFF"))
+        # 3) process scheduled exits (if not already force-exited)
+        if d in exits_by_day and positions:
+            prices = close_pivot.loc[d]
+            for _, r in exits_by_day[d].iterrows():
+                tid = int(r["trade_id"])
+                if tid not in positions:
+                    continue
+                p = positions.pop(tid)
+                px = prices.get(p["ticker"], np.nan)
+                if pd.isna(px):
+                    px = float(r["exit"])
+                entry_adj, exit_adj = apply_costs(p["entry_px"], float(px))
+                ret = (exit_adj / entry_adj) - 1.0
+                cash += p["notional"] * (1.0 + ret)
+                events.append((pd.Timestamp(d).tz_localize("UTC"), "CLOSE", p["ticker"], tid, str(r.get("exit_reason",""))))
+            eq = compute_equity(d)
 
-    for et in entry_times:
-        close_positions_by_time(et)
+        # 4) open new trades for this day (if market allows entries that day)
+        if d in entries_by_day:
+            if ms_map.get(d, "neutral") in ALLOW_ENTRY_STATES:
+                batch = entries_by_day[d].copy()
 
-        d_et = pd.to_datetime(et, utc=True).normalize()
-        force_exit_on_day(d_et, et)
+                # capacity: max_positions + util cap
+                current_equity = compute_equity(d)
+                free_slots = MAX_POSITIONS - len(positions)
+                if free_slots > 0 and current_equity > 0:
+                    current_util = used_util(current_equity)
+                    free_util = max(0.0, CAPITAL_UTIL - current_util)
+                    # open trades by score until capacity
+                    batch = batch.sort_values("score", ascending=False)
 
-        free_slots = MAX_POSITIONS - len(open_pos)
-        if free_slots <= 0:
-            continue
+                    prices = close_pivot.loc[d]
 
-        used_frac = sum(p["pos_frac"] for p in open_pos.values())
-        free_frac = max(0.0, CAPITAL_UTIL - used_frac)
-        if free_frac <= 0:
-            continue
+                    for _, r in batch.iterrows():
+                        if free_slots <= 0:
+                            break
+                        current_equity = compute_equity(d)
+                        current_util = used_util(current_equity)
+                        free_util = max(0.0, CAPITAL_UTIL - current_util)
+                        if free_util <= 0:
+                            break
 
-        batch = trades[trades["entry_time"] == et].copy()
-        if batch.empty:
-            continue
+                        size_mult = float(r.get("size_mult", 1.0))
+                        pos_frac = POS_FRACTION * size_mult
+                        # util consumed approx pos_frac (since notional = pos_frac * equity)
+                        if pos_frac <= 0:
+                            continue
+                        if pos_frac > free_util:
+                            continue
 
-        max_by_frac = int(free_frac / POS_FRACTION) if POS_FRACTION > 0 else 0
-        can_open = max(0, min(free_slots, max_by_frac))
-        if can_open <= 0:
-            continue
+                        # need price
+                        px = prices.get(r["ticker"], np.nan)
+                        if pd.isna(px):
+                            continue
 
-        batch = batch.sort_values("score", ascending=False).head(can_open)
+                        # apply costs on entry
+                        entry_adj, _ = apply_costs(float(px), float(px))
+                        notional = pos_frac * current_equity
+                        cash -= notional  # invest notional (can go negative -> leverage)
 
-        for _, r in batch.iterrows():
-            entry_px = float(r["entry"])
-            planned_exit_px = float(r["exit"])
+                        tid = int(r["trade_id"])
+                        positions[tid] = {
+                            "ticker": r["ticker"],
+                            "entry_px": float(entry_adj),
+                            "notional": float(notional),
+                        }
+                        events.append((pd.Timestamp(d).tz_localize("UTC"), "OPEN", r["ticker"], tid, ""))
+                        free_slots -= 1
 
-            entry_adj, exit_adj = apply_costs(entry_px, planned_exit_px)
-            planned_ret = (exit_adj / entry_adj) - 1.0
+        # 5) record daily equity
+        eq_end = compute_equity(d)
+        equity_curve.append((pd.Timestamp(d).tz_localize("UTC"), eq_end))
 
-            open_pos[int(r["trade_id"])] = {
-                "ticker": r["ticker"],
-                "entry_time": r["entry_time"],
-                "close_time": r["exit_time"],
-                "planned_exit_px": planned_exit_px,
-                "entry_px": entry_px,
-                "ret": planned_ret,
-                "pos_frac": POS_FRACTION,
-                "close_reason": r["exit_reason"],
-            }
-            events.append((r["entry_time"], equity, "OPEN", r["ticker"], int(r["trade_id"]), ""))
-
-        force_exit_on_day(d_et, et)
-
-    close_positions_by_time(pd.Timestamp.max.tz_localize("UTC"))
-
-    events_df = pd.DataFrame(events, columns=["time","equity","event","ticker","trade_id","reason"])
-    equity_df = events_df[events_df["event"].isin(["CLOSE","FORCE_EXIT"])][["time","equity"]].reset_index(drop=True)
+    equity_df = pd.DataFrame(equity_curve, columns=["date","equity"])
+    events_df = pd.DataFrame(events, columns=["time","event","ticker","trade_id","reason"])
     return equity_df, events_df
 
 def main():
-    # Load market state
     ms = load_market_state()
     ms_map = dict(zip(ms["d"], ms["market_state"]))
 
     tickers = list_tickers(DATA_PREFIX)
-
     print("Tickers:", len(tickers))
-    print("ENV CHECK:",
-          "IMPULSE_RET1_MIN", IMPULSE_RET1_MIN,
-          "IMPULSE_RET2_MIN", IMPULSE_RET2_MIN,
-          "VOL_MULT_IMP", VOL_MULT_IMP,
-          "IMPULSE_MEMORY_DAYS", IMPULSE_MEMORY_DAYS,
-          "CONS_MAX_RANGE_PCT", CONS_MAX_RANGE_PCT,
-          "ALLOW_ENTRY_STATES", ALLOW_ENTRY_STATES,
-          "TAIL_DAYS", TAIL_DAYS)
 
     all_trades = []
     diags = []
 
-    for i, t in enumerate(tickers, 1):
+    for i, tkr in enumerate(tickers, 1):
         try:
-            df = read_parquet(f"{DATA_PREFIX}{t}.parquet")
+            df = read_parquet(f"{DATA_PREFIX}{tkr}.parquet")
             if df is None or df.empty:
                 continue
-
-            tr, diag = generate_trades(df, t, ms_map)
+            tr, diag = generate_trades(df, tkr, ms_map)
             diags.append(diag)
             if not tr.empty:
                 all_trades.append(tr)
-
             if i % 50 == 0:
                 print(f"Processed {i}/{len(tickers)}")
-
         except Exception as e:
-            print("Error:", t, e)
+            print("Error:", tkr, e)
 
     trades = pd.concat(all_trades, ignore_index=True) if all_trades else pd.DataFrame()
     diag_df = pd.DataFrame(diags)
 
-    equity_df, events_df = simulate_portfolio(trades, ms)
+    equity_df, events_df = simulate_portfolio_daily(trades, ms)
 
     env_debug = {
         "IMPULSE_RET1_MIN": os.getenv("IMPULSE_RET1_MIN"),
@@ -501,11 +616,16 @@ def main():
         "CAPITAL_UTIL": os.getenv("CAPITAL_UTIL"),
         "POS_FRACTION": os.getenv("POS_FRACTION"),
         "TAIL_DAYS": os.getenv("TAIL_DAYS"),
+        "TRAIL_MODE": os.getenv("TRAIL_MODE"),
+        "TRAIL_ATR_MULT": os.getenv("TRAIL_ATR_MULT"),
+        "ENABLE_PARTIAL_TP": os.getenv("ENABLE_PARTIAL_TP"),
+        "PARTIAL_TP_R": os.getenv("PARTIAL_TP_R"),
+        "PARTIAL_FRACTION": os.getenv("PARTIAL_FRACTION"),
         "MARKET_STATE_KEY": os.getenv("MARKET_STATE_KEY"),
     }
 
     stats = {
-        "mode": "POOS DAILY (POOS-like impulse+consolidation) + MARKET ENGINE GATING",
+        "mode": "POOS DAILY (POOS-like) + MARKET GATING + TRAILING + DAILY MTM",
         "tickers_tested": int(len(tickers)),
         "trades": int(len(trades)) if not trades.empty else 0,
         "final_equity": float(equity_df["equity"].iloc[-1]) if not equity_df.empty else 1.0,
@@ -529,6 +649,11 @@ def main():
             "stop_atr": float(STOP_ATR),
             "tp_atr": float(TP_ATR),
             "move_be_pct": float(MOVE_BE_PCT),
+            "trail_mode": str(TRAIL_MODE),
+            "trail_atr_mult": float(TRAIL_ATR_MULT),
+            "enable_partial_tp": bool(ENABLE_PARTIAL_TP),
+            "partial_tp_r": float(PARTIAL_TP_R),
+            "partial_fraction": float(PARTIAL_FRACTION),
             "max_hold_days": int(MAX_HOLD_DAYS),
             "cooloff_days": int(COOLOFF_DAYS),
             "tail_days": int(TAIL_DAYS),
@@ -543,17 +668,16 @@ def main():
     }
 
     put_text(f"{RESULT_PREFIX}/stats.json", json.dumps(stats, indent=2))
-    put_text(f"{RESULT_PREFIX}/trades.csv", trades.to_csv(index=False) if not trades.empty else "ticker,entry_time,exit_time,entry,exit,stop_init,tp,exit_reason,hold_days,be_moved,score,entry_market_state\n")
-    put_text(f"{RESULT_PREFIX}/equity.csv", equity_df.to_csv(index=False) if not equity_df.empty else "time,equity\n")
-    put_text(f"{RESULT_PREFIX}/events.csv", events_df.to_csv(index=False) if not events_df.empty else "time,equity,event,ticker,trade_id,reason\n")
-    put_text(f"{RESULT_PREFIX}/diag.csv", diag_df.to_csv(index=False) if not diag_df.empty else "ticker,rows,impulses,impulse_recent_days,tight_days,trend_ok_days\n")
+    put_text(f"{RESULT_PREFIX}/trades.csv", trades.to_csv(index=False) if not trades.empty else "ticker,entry_time,exit_time,entry,exit,exit_reason,hold_days,be_moved,score,entry_market_state,size_mult\n")
+    put_text(f"{RESULT_PREFIX}/equity.csv", equity_df.to_csv(index=False) if not equity_df.empty else "date,equity\n")
+    put_text(f"{RESULT_PREFIX}/events.csv", events_df.to_csv(index=False) if not events_df.empty else "time,event,ticker,trade_id,reason\n")
+    put_text(f"{RESULT_PREFIX}/diag.csv", diag_df.to_csv(index=False) if not diag_df.empty else "ticker,rows,impulses,impulse_recent_days,tight_days\n")
 
-    # Plot equity
     plt.figure()
     if not equity_df.empty:
-        plt.plot(pd.to_datetime(equity_df["time"]), equity_df["equity"])
+        plt.plot(pd.to_datetime(equity_df["date"]), equity_df["equity"])
         plt.xticks(rotation=30, ha="right")
-        plt.title("POOS Daily Equity (POOS-like, market-gated)")
+        plt.title("POOS Daily Equity (market-gated, trailing, daily MTM)")
         plt.tight_layout()
     else:
         plt.text(0.5, 0.5, "No trades", ha="center", va="center")
