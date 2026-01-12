@@ -1,3 +1,4 @@
-worker: python src/poos_market_engine.py
+worker: python src/poos_backtest_daily.py
+
 
 
