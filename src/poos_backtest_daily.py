@@ -73,19 +73,19 @@ COOLOFF_DAYS  = int(os.getenv("COOLOFF_DAYS", "10"))
 
 TAIL_DAYS = int(os.getenv("TAIL_DAYS", "504"))
 
-# ===================== RS + Dynamic exposure (NEW) =====================
+# ===================== RS + Dynamic exposure =====================
 RS_WIN1 = int(os.getenv("RS_WIN1", "63"))
 RS_WIN2 = int(os.getenv("RS_WIN2", "126"))
 RS_TOP_Q = float(os.getenv("RS_TOP_Q", "0.70"))  # 0.70 => top 30%
 
 # optional sector filters (enabled only if sector_map loaded)
 SECTOR_ENABLE = os.getenv("SECTOR_ENABLE", "1") == "1"
-SECTOR_TOP_Q = float(os.getenv("SECTOR_TOP_Q", "0.50"))  # top 50% sectors by avg RS
-IN_SECTOR_TOP_Q = float(os.getenv("IN_SECTOR_TOP_Q", "0.60"))  # ticker must be top 40% in its sector
+SECTOR_TOP_Q = float(os.getenv("SECTOR_TOP_Q", "0.50"))       # top 50% sectors by avg RS
+IN_SECTOR_TOP_Q = float(os.getenv("IN_SECTOR_TOP_Q", "0.60")) # ticker must be top 40% in its sector
 
 # dynamic exposure by market_score
 DYNEXP_ENABLE = os.getenv("DYNEXP_ENABLE", "1") == "1"
-SCORE_MIN_EXPO = float(os.getenv("SCORE_MIN_EXPO", "0.20"))  # even if score low but still allowed, keep at least 20% expo
+SCORE_MIN_EXPO = float(os.getenv("SCORE_MIN_EXPO", "0.20"))
 SCORE_MAX_EXPO = float(os.getenv("SCORE_MAX_EXPO", "1.00"))
 
 # ===================== R2 client =====================
@@ -160,7 +160,6 @@ def load_market_state() -> pd.DataFrame:
     ms = pd.read_csv(io.StringIO(read_text(MARKET_STATE_KEY)))
     ms["date"] = pd.to_datetime(ms["date"], utc=True)
     ms["d"] = ms["date"].dt.normalize()
-    # ensure market_score exists
     if "market_score" not in ms.columns:
         ms["market_score"] = np.nan
     return ms[["date","d","market_state","market_score"]].sort_values("date")
@@ -199,18 +198,12 @@ def build_close_matrix(tickers: list[str], start: pd.Timestamp, end: pd.Timestam
     return close_df.pivot(index="date", columns="ticker", values="close").sort_index()
 
 def compute_rs_table(close_pivot: pd.DataFrame) -> pd.DataFrame:
-    """
-    Returns DataFrame indexed by date with columns:
-      - per-ticker RS score (float) in [0..1] (rank-normalized)
-      - rs_threshold (per date quantile)
-    """
     if close_pivot.empty:
         return pd.DataFrame()
+    # FIX: avoid future deprecated pad-fill
+    ret1 = close_pivot.pct_change(RS_WIN1, fill_method=None)
+    ret2 = close_pivot.pct_change(RS_WIN2, fill_method=None)
 
-    ret1 = close_pivot.pct_change(RS_WIN1)
-    ret2 = close_pivot.pct_change(RS_WIN2)
-
-    # ranks per date across tickers (ignore NaNs)
     r1 = ret1.rank(axis=1, pct=True)
     r2 = ret2.rank(axis=1, pct=True)
 
@@ -219,21 +212,15 @@ def compute_rs_table(close_pivot: pd.DataFrame) -> pd.DataFrame:
     return rs
 
 def compute_sector_filters(rs_row: pd.Series, sector_map: dict) -> tuple[set[str], dict]:
-    """
-    Given rs for a single day (tickers -> score), returns allowed tickers set.
-    Also returns debug dict.
-    """
-    # if no sector map, allow all
     if not sector_map:
-        return set(rs_row.index.tolist()), {"sector_enabled": False}
+        tickers = [c for c in rs_row.index if c != "rs_threshold"]
+        return set(tickers), {"sector_enabled": False}
 
     tickers = [c for c in rs_row.index if c != "rs_threshold"]
     df = pd.DataFrame({"ticker": tickers, "rs": rs_row[tickers].values})
     df["sector"] = df["ticker"].map(sector_map).fillna("UNKNOWN")
 
-    # sector strength = mean rs
     sector_strength = df.groupby("sector")["rs"].mean().sort_values(ascending=False)
-    # keep top sectors by quantile
     if len(sector_strength) <= 1:
         top_sectors = set(sector_strength.index.tolist())
     else:
@@ -241,8 +228,6 @@ def compute_sector_filters(rs_row: pd.Series, sector_map: dict) -> tuple[set[str
         top_sectors = set(sector_strength[sector_strength >= thr].index.tolist())
 
     df["in_top_sector"] = df["sector"].isin(top_sectors)
-
-    # within-sector rank
     df["rs_in_sector_pct"] = df.groupby("sector")["rs"].rank(pct=True)
     df["in_sector_top"] = df["rs_in_sector_pct"] >= IN_SECTOR_TOP_Q
 
@@ -330,17 +315,14 @@ def generate_trades_for_ticker(df: pd.DataFrame, ticker: str, ms_map: dict):
 
         mstate = ms_map.get(d, "neutral")
 
-        # manage
         if in_pos:
             hold += 1
             lo, hi, cl = float(row["low"]), float(row["high"]), float(row["close"])
 
-            # move BE
             if (not be_moved) and hi >= entry * (1.0 + MOVE_BE_PCT):
                 stop = max(stop, entry)
                 be_moved = True
 
-            # trail if BE already moved (keeps it POOS-like; not trailing immediately)
             if be_moved:
                 a = row["atr"]
                 e = row["ema20"]
@@ -351,12 +333,10 @@ def generate_trades_for_ticker(df: pd.DataFrame, ticker: str, ms_map: dict):
                         trail = float(cl) - TRAIL_ATR_MULT * float(a)
                     stop = max(stop, trail)
 
-            # partial
             if ENABLE_PARTIAL_TP and (not partial_done) and (r_unit is not None) and (r_unit > 0):
                 target_partial = entry + PARTIAL_TP_R * r_unit
                 if hi >= target_partial:
                     partial_done = True
-                    # record partial as separate trade row
                     trades.append({
                         "ticker": ticker,
                         "entry_time": entry_time,
@@ -371,7 +351,6 @@ def generate_trades_for_ticker(df: pd.DataFrame, ticker: str, ms_map: dict):
                         "size_mult": float(PARTIAL_FRACTION),
                     })
 
-            # TP
             if tp is not None and hi >= tp:
                 rem = 1.0 - (PARTIAL_FRACTION if partial_done else 0.0)
                 if rem > 0:
@@ -392,7 +371,6 @@ def generate_trades_for_ticker(df: pd.DataFrame, ticker: str, ms_map: dict):
                 cooldown_until = i + COOLOFF_DAYS
                 continue
 
-            # STOP
             if lo <= stop:
                 rem = 1.0 - (PARTIAL_FRACTION if partial_done else 0.0)
                 if rem > 0:
@@ -413,7 +391,6 @@ def generate_trades_for_ticker(df: pd.DataFrame, ticker: str, ms_map: dict):
                 cooldown_until = i + COOLOFF_DAYS
                 continue
 
-            # TIME
             if hold >= MAX_HOLD_DAYS:
                 exit_px = float(row["close"])
                 rem = 1.0 - (PARTIAL_FRACTION if partial_done else 0.0)
@@ -435,7 +412,6 @@ def generate_trades_for_ticker(df: pd.DataFrame, ticker: str, ms_map: dict):
                 cooldown_until = i + COOLOFF_DAYS
                 continue
 
-        # setup -> watch
         if not in_pos:
             if not watch:
                 if (mstate in ALLOW_ENTRY_STATES) and bool(row["impulse_recent"]) and bool(row["trend_ok"]):
@@ -445,7 +421,6 @@ def generate_trades_for_ticker(df: pd.DataFrame, ticker: str, ms_map: dict):
                     watch_score = float(burst) * float(vol_ratio)
                     watch = True
             else:
-                # invalidate watch if market goes off
                 if mstate not in ALLOW_ENTRY_STATES:
                     watch = False
                     watch_score = None
@@ -464,7 +439,6 @@ def generate_trades_for_ticker(df: pd.DataFrame, ticker: str, ms_map: dict):
                 if pd.isna(a) or pd.isna(e):
                     continue
 
-                # entry on pullback to EMA20
                 if float(row["low"]) <= float(e):
                     entry = float(e)
                     entry_time = t
@@ -491,7 +465,7 @@ def simulate_portfolio_daily(trades: pd.DataFrame,
                              sector_map: dict,
                              sector_loaded: bool):
     if trades.empty or close_pivot.empty:
-        return pd.DataFrame(columns=["date","equity"]), pd.DataFrame()
+        return pd.DataFrame(columns=["date","equity"]), pd.DataFrame(), {"opened": 0, "open_attempts": 0, "rs_reject": 0, "sector_reject": 0}
 
     trades = trades.copy()
     trades["entry_time"] = pd.to_datetime(trades["entry_time"], utc=True)
@@ -536,7 +510,6 @@ def simulate_portfolio_daily(trades: pd.DataFrame,
         notional_sum = sum(p["notional"] for p in positions.values())
         return (notional_sum / current_equity) if current_equity > 0 else 0.0
 
-    # debug counters
     rs_reject = 0
     sector_reject = 0
     open_attempts = 0
@@ -549,9 +522,8 @@ def simulate_portfolio_daily(trades: pd.DataFrame,
         mstate = ms_map.get(pd.Timestamp(d), "neutral")
         mscore = ms_score_map.get(pd.Timestamp(d), np.nan)
         if pd.isna(mscore):
-            mscore = 5.0  # neutral default
+            mscore = 5.0
 
-        # dynamic scale from score 0..10 -> 0..1
         if DYNEXP_ENABLE:
             scale = float(np.clip(mscore / 10.0, SCORE_MIN_EXPO, SCORE_MAX_EXPO))
         else:
@@ -598,34 +570,40 @@ def simulate_portfolio_daily(trades: pd.DataFrame,
             if mstate in ALLOW_ENTRY_STATES:
                 batch = entries_by_day[pd.Timestamp(d)].copy()
 
-                # RS filter for the day
+                # ALWAYS create rs column (FIX)
+                batch["rs"] = np.nan
+
+                # RS filter for day if available
                 if (not rs_table.empty) and (pd.Timestamp(d) in rs_table.index):
                     rs_row = rs_table.loc[pd.Timestamp(d)]
                     rs_thr = float(rs_row.get("rs_threshold", np.nan))
+                    # map per ticker rs
+                    batch["rs"] = batch["ticker"].map(lambda x: float(rs_row.get(x, np.nan)))
                     if not np.isnan(rs_thr):
-                        batch["rs"] = batch["ticker"].map(lambda x: float(rs_row.get(x, np.nan)))
                         pre_n = len(batch)
                         batch = batch[batch["rs"] >= rs_thr].copy()
                         rs_reject += int(pre_n - len(batch))
-                else:
-                    batch["rs"] = np.nan
 
-                # Sector leadership filter (only if map exists)
-                sector_dbg = {}
+                # sector filter (optional)
                 if sector_loaded and (not rs_table.empty) and (pd.Timestamp(d) in rs_table.index):
-                    allowed_by_sector, sector_dbg = compute_sector_filters(rs_table.loc[pd.Timestamp(d)], sector_map)
+                    allowed_by_sector, _ = compute_sector_filters(rs_table.loc[pd.Timestamp(d)], sector_map)
                     pre_n = len(batch)
                     batch = batch[batch["ticker"].isin(allowed_by_sector)].copy()
                     sector_reject += int(pre_n - len(batch))
 
-                current_equity = compute_equity(d)
+                if batch.empty:
+                    continue
 
+                current_equity = compute_equity(d)
                 free_slots = eff_max_positions - len(positions)
                 if free_slots > 0 and current_equity > 0:
-                    # strongest setups first
-                    batch = batch.sort_values(["score","rs"], ascending=False)
-                    prices = close_pivot.loc[d]
+                    # SAFE SORT (FIX)
+                    sort_cols = ["score"]
+                    if "rs" in batch.columns:
+                        sort_cols.append("rs")
+                    batch = batch.sort_values(sort_cols, ascending=False)
 
+                    prices = close_pivot.loc[d]
                     for _, r in batch.iterrows():
                         open_attempts += 1
                         if free_slots <= 0:
@@ -659,8 +637,7 @@ def simulate_portfolio_daily(trades: pd.DataFrame,
                         opened += 1
                         free_slots -= 1
 
-        eq_end = compute_equity(d)
-        equity_curve.append((d_utc, eq_end))
+        equity_curve.append((d_utc, compute_equity(d)))
 
     equity_df = pd.DataFrame(equity_curve, columns=["date","equity"])
     events_df = pd.DataFrame(events, columns=["time","event","ticker","trade_id","reason"])
@@ -678,10 +655,6 @@ def main():
     tickers = list_tickers(DATA_PREFIX)
     print("Tickers:", len(tickers))
 
-    # build calendar based on available closes
-    # (use the overlapping date range of all tickers we have)
-    # We'll just use the union calendar from pivot; NaNs are fine for non-traded tickers on that day.
-    # Determine rough range from market_state dates
     start = ms["d"].min()
     end = ms["d"].max()
 
@@ -690,14 +663,11 @@ def main():
         print("No close data found.")
         return
 
-    # RS table across your 250 tickers
     rs_table = compute_rs_table(close_pivot)
 
-    # optional sector map
     sector_map, sector_loaded = try_load_sector_map(tickers)
     print("Sector map loaded:", sector_loaded, "count:", len(sector_map))
 
-    # market state map (for setup stage)
     ms_map = dict(zip(ms["d"], ms["market_state"]))
 
     all_trades = []
@@ -722,130 +692,39 @@ def main():
 
     equity_df, events_df, sim_debug = simulate_portfolio_daily(trades, ms, close_pivot, rs_table, sector_map, sector_loaded)
 
-    # RS snapshot (last date): which tickers are leaders now
-    rs_snapshot = pd.DataFrame()
-    last_d = close_pivot.index.max()
-    if (not rs_table.empty) and (last_d in rs_table.index):
-        row = rs_table.loc[last_d].drop(labels=["rs_threshold"], errors="ignore")
-        rs_snapshot = row.rename("rs").to_frame().reset_index().rename(columns={"index":"ticker"})
-        rs_snapshot = rs_snapshot.sort_values("rs", ascending=False)
-        thr = float(rs_table.loc[last_d].get("rs_threshold", np.nan))
-        rs_snapshot["is_top"] = rs_snapshot["rs"] >= thr
-
     env_debug = {
-        # setup
-        "IMPULSE_RET1_MIN": os.getenv("IMPULSE_RET1_MIN"),
-        "IMPULSE_RET2_MIN": os.getenv("IMPULSE_RET2_MIN"),
-        "VOL_MULT_IMP": os.getenv("VOL_MULT_IMP"),
-        "IMPULSE_MEMORY_DAYS": os.getenv("IMPULSE_MEMORY_DAYS"),
-        "CONS_MAX_RANGE_PCT": os.getenv("CONS_MAX_RANGE_PCT"),
-        "MAX_HOLD_DAYS": os.getenv("MAX_HOLD_DAYS"),
-        "STOP_ATR": os.getenv("STOP_ATR"),
-        "TP_ATR": os.getenv("TP_ATR"),
-        "TRAIL_ATR_MULT": os.getenv("TRAIL_ATR_MULT"),
-        "ENABLE_PARTIAL_TP": os.getenv("ENABLE_PARTIAL_TP"),
-        # portfolio
-        "MAX_POSITIONS": os.getenv("MAX_POSITIONS"),
-        "CAPITAL_UTIL": os.getenv("CAPITAL_UTIL"),
-        "POS_FRACTION": os.getenv("POS_FRACTION"),
-        # RS/dynexp
         "RS_WIN1": os.getenv("RS_WIN1"),
         "RS_WIN2": os.getenv("RS_WIN2"),
         "RS_TOP_Q": os.getenv("RS_TOP_Q"),
         "DYNEXP_ENABLE": os.getenv("DYNEXP_ENABLE"),
         "SCORE_MIN_EXPO": os.getenv("SCORE_MIN_EXPO"),
-        "SECTOR_MAP_KEY": os.getenv("SECTOR_MAP_KEY"),
+        "SCORE_MAX_EXPO": os.getenv("SCORE_MAX_EXPO"),
         "SECTOR_ENABLE": os.getenv("SECTOR_ENABLE"),
-        "SECTOR_TOP_Q": os.getenv("SECTOR_TOP_Q"),
-        "IN_SECTOR_TOP_Q": os.getenv("IN_SECTOR_TOP_Q"),
+        "SECTOR_MAP_KEY": os.getenv("SECTOR_MAP_KEY"),
     }
 
     stats = {
-        "mode": "POOS DAILY v3 (POOS-like setups) + MARKET GATING + RS TOP + DYN EXPOSURE" + (" + SECTOR" if sector_loaded else ""),
+        "mode": "POOS DAILY v3.1 FIX (RS top + dyn exposure) " + ("+SECTOR" if sector_loaded else ""),
         "tickers_tested": int(len(tickers)),
         "raw_trades": int(len(trades)) if not trades.empty else 0,
         "final_equity": float(equity_df["equity"].iloc[-1]) if not equity_df.empty else 1.0,
-        "base": {
-            "max_positions": int(BASE_MAX_POSITIONS),
-            "capital_util": float(BASE_CAPITAL_UTIL),
-            "pos_fraction": float(BASE_POS_FRACTION),
-        },
-        "costs": {
-            "slippage_bps_per_side": float(SLIPPAGE_BPS),
-            "commission_bps_per_side": float(COMMISSION_BPS),
-        },
-        "market_gating": {
-            "allow_entry_states": ALLOW_ENTRY_STATES,
-            "force_exit_states": FORCE_EXIT_STATES,
-            "market_state_counts": ms["market_state"].value_counts().to_dict(),
-        },
-        "rs_filter": {
-            "rs_win1": int(RS_WIN1),
-            "rs_win2": int(RS_WIN2),
-            "rs_top_q": float(RS_TOP_Q),
-        },
-        "sector_filter": {
-            "enabled": bool(sector_loaded),
-            "sector_top_q": float(SECTOR_TOP_Q),
-            "in_sector_top_q": float(IN_SECTOR_TOP_Q),
-            "sector_map_key": SECTOR_MAP_KEY,
-            "sector_map_loaded_rows": int(len(sector_map)),
-        },
-        "dyn_exposure": {
-            "enabled": bool(DYNEXP_ENABLE),
-            "score_min_expo": float(SCORE_MIN_EXPO),
-            "score_max_expo": float(SCORE_MAX_EXPO),
-        },
-        "setup_params": {
-            "impulse_ret1_min": float(IMPULSE_RET1_MIN),
-            "impulse_ret2_min": float(IMPULSE_RET2_MIN),
-            "vol_mult_imp": float(VOL_MULT_IMP),
-            "impulse_memory_days": int(IMPULSE_MEMORY_DAYS),
-            "cons_lookback": int(CONS_LOOKBACK),
-            "cons_max_range_pct": float(CONS_MAX_RANGE_PCT),
-            "use_trend_filter": bool(USE_TREND_FILTER),
-            "entry_ema": int(ENTRY_EMA),
-            "atr_period": int(ATR_PERIOD),
-            "stop_atr": float(STOP_ATR),
-            "tp_atr": float(TP_ATR),
-            "move_be_pct": float(MOVE_BE_PCT),
-            "trail_mode": str(TRAIL_MODE),
-            "trail_atr_mult": float(TRAIL_ATR_MULT),
-            "enable_partial_tp": bool(ENABLE_PARTIAL_TP),
-            "partial_tp_r": float(PARTIAL_TP_R),
-            "partial_fraction": float(PARTIAL_FRACTION),
-            "max_hold_days": int(MAX_HOLD_DAYS),
-            "cooloff_days": int(COOLOFF_DAYS),
-            "tail_days": int(TAIL_DAYS),
-        },
-        "diag_sum": {
-            "impulses_total": int(diag_df["impulses"].sum()) if not diag_df.empty else 0,
-            "impulse_recent_days_total": int(diag_df["impulse_recent_days"].sum()) if not diag_df.empty else 0,
-            "tight_days_total": int(diag_df["tight_days"].sum()) if not diag_df.empty else 0,
-        },
         "sim_debug": sim_debug,
         "env_debug": env_debug,
     }
 
-    # outputs
     put_text(f"{RESULT_PREFIX}/stats.json", json.dumps(stats, indent=2))
-    put_text(f"{RESULT_PREFIX}/trades.csv",
-             trades.to_csv(index=False) if not trades.empty
-             else "ticker,entry_time,exit_time,entry,exit,exit_reason,hold_days,be_moved,score,entry_market_state,size_mult\n")
+    put_text(f"{RESULT_PREFIX}/trades.csv", trades.to_csv(index=False) if not trades.empty else "ticker,entry_time,exit_time,entry,exit,exit_reason,hold_days,be_moved,score,entry_market_state,size_mult\n")
     put_text(f"{RESULT_PREFIX}/equity.csv", equity_df.to_csv(index=False) if not equity_df.empty else "date,equity\n")
     put_text(f"{RESULT_PREFIX}/events.csv", events_df.to_csv(index=False) if not events_df.empty else "time,event,ticker,trade_id,reason\n")
-    put_text(f"{RESULT_PREFIX}/diag.csv",
-             diag_df.to_csv(index=False) if not diag_df.empty else "ticker,rows,impulses,impulse_recent_days,tight_days\n")
-    if not rs_snapshot.empty:
-        put_text(f"{RESULT_PREFIX}/rs_snapshot.csv", rs_snapshot.to_csv(index=False))
     put_text(f"{RESULT_PREFIX}/market_score.csv", ms.to_csv(index=False))
+    if not diag_df.empty:
+        put_text(f"{RESULT_PREFIX}/diag.csv", diag_df.to_csv(index=False))
 
-    # equity plot
     plt.figure()
     if not equity_df.empty:
         plt.plot(pd.to_datetime(equity_df["date"]), equity_df["equity"])
         plt.xticks(rotation=30, ha="right")
-        plt.title("POOS Daily Equity (RS top + dyn exposure, costs)")
+        plt.title("POOS Daily Equity (RS top + dyn exposure)")
         plt.tight_layout()
     else:
         plt.text(0.5, 0.5, "No trades", ha="center", va="center")
