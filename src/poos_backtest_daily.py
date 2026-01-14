@@ -1,6 +1,7 @@
 import os
 import io
 import json
+import math
 import numpy as np
 import pandas as pd
 import boto3
@@ -25,7 +26,7 @@ MARKET_STATE_KEY = os.getenv("MARKET_STATE_KEY", "results/poos_market_engine_v1/
 # optional: ticker,sector (csv)
 SECTOR_MAP_KEY = os.getenv("SECTOR_MAP_KEY", "results/poos_meta/sector_map.csv")
 
-RESULT_PREFIX = os.getenv("RESULT_PREFIX", "results/poos_daily_v3_rs_dynexp")
+RESULT_PREFIX = os.getenv("RESULT_PREFIX", "results/poos_daily_v3_2_moderate")
 
 # ===================== Costs =====================
 SLIPPAGE_BPS   = float(os.getenv("SLIPPAGE_BPS", "5"))
@@ -56,15 +57,15 @@ ENTRY_EMA = int(os.getenv("ENTRY_EMA", "20"))
 ATR_PERIOD = int(os.getenv("ATR_PERIOD", "14"))
 
 STOP_ATR = float(os.getenv("STOP_ATR", "1.5"))
-TP_ATR = float(os.getenv("TP_ATR", "8.0"))
+TP_ATR = float(os.getenv("TP_ATR", "8.0"))  # keep as far target; trailing will usually manage
 MOVE_BE_PCT = float(os.getenv("MOVE_BE_PCT", "0.01"))
 
-# trailing
+# trailing (moderate)
 TRAIL_MODE = os.getenv("TRAIL_MODE", "ema_atr")  # ema_atr / close_atr
-TRAIL_ATR_MULT = float(os.getenv("TRAIL_ATR_MULT", "2.2"))
+TRAIL_ATR_MULT = float(os.getenv("TRAIL_ATR_MULT", "1.8"))
 
-# partial tp
-ENABLE_PARTIAL_TP = os.getenv("ENABLE_PARTIAL_TP", "0") == "1"
+# partial tp (moderate default ON via env)
+ENABLE_PARTIAL_TP = os.getenv("ENABLE_PARTIAL_TP", "1") == "1"
 PARTIAL_TP_R = float(os.getenv("PARTIAL_TP_R", "2.0"))
 PARTIAL_FRACTION = float(os.getenv("PARTIAL_FRACTION", "0.50"))
 
@@ -87,6 +88,14 @@ IN_SECTOR_TOP_Q = float(os.getenv("IN_SECTOR_TOP_Q", "0.60")) # ticker must be t
 DYNEXP_ENABLE = os.getenv("DYNEXP_ENABLE", "1") == "1"
 SCORE_MIN_EXPO = float(os.getenv("SCORE_MIN_EXPO", "0.20"))
 SCORE_MAX_EXPO = float(os.getenv("SCORE_MAX_EXPO", "1.00"))
+
+# ===================== NEW: score sizing + entry throttles =====================
+SCORE_SIZING_ENABLE = os.getenv("SCORE_SIZING_ENABLE", "1") == "1"
+SCORE_SIZING_TOP_Q = float(os.getenv("SCORE_SIZING_TOP_Q", "0.75"))  # top 25%
+SCORE_SIZING_MULT  = float(os.getenv("SCORE_SIZING_MULT",  "1.25"))  # mild boost
+
+MAX_OPENS_PER_DAY = int(os.getenv("MAX_OPENS_PER_DAY", "25"))  # keeps portfolio focused
+ONE_OPEN_PER_TICKER_PER_DAY = os.getenv("ONE_OPEN_PER_TICKER_PER_DAY", "1") == "1"
 
 # ===================== R2 client =====================
 s3 = boto3.client(
@@ -200,13 +209,10 @@ def build_close_matrix(tickers: list[str], start: pd.Timestamp, end: pd.Timestam
 def compute_rs_table(close_pivot: pd.DataFrame) -> pd.DataFrame:
     if close_pivot.empty:
         return pd.DataFrame()
-    # FIX: avoid future deprecated pad-fill
     ret1 = close_pivot.pct_change(RS_WIN1, fill_method=None)
     ret2 = close_pivot.pct_change(RS_WIN2, fill_method=None)
-
     r1 = ret1.rank(axis=1, pct=True)
     r2 = ret2.rank(axis=1, pct=True)
-
     rs = 0.6 * r1 + 0.4 * r2
     rs["rs_threshold"] = rs.quantile(RS_TOP_Q, axis=1, numeric_only=True)
     return rs
@@ -319,10 +325,12 @@ def generate_trades_for_ticker(df: pd.DataFrame, ticker: str, ms_map: dict):
             hold += 1
             lo, hi, cl = float(row["low"]), float(row["high"]), float(row["close"])
 
+            # move to BE once price moves sufficiently
             if (not be_moved) and hi >= entry * (1.0 + MOVE_BE_PCT):
                 stop = max(stop, entry)
                 be_moved = True
 
+            # trailing after BE
             if be_moved:
                 a = row["atr"]
                 e = row["ema20"]
@@ -333,10 +341,14 @@ def generate_trades_for_ticker(df: pd.DataFrame, ticker: str, ms_map: dict):
                         trail = float(cl) - TRAIL_ATR_MULT * float(a)
                     stop = max(stop, trail)
 
+            # partial take profit
             if ENABLE_PARTIAL_TP and (not partial_done) and (r_unit is not None) and (r_unit > 0):
                 target_partial = entry + PARTIAL_TP_R * r_unit
                 if hi >= target_partial:
                     partial_done = True
+                    # after partial, force BE
+                    stop = max(stop, entry)
+                    be_moved = True
                     trades.append({
                         "ticker": ticker,
                         "entry_time": entry_time,
@@ -351,7 +363,8 @@ def generate_trades_for_ticker(df: pd.DataFrame, ticker: str, ms_map: dict):
                         "size_mult": float(PARTIAL_FRACTION),
                     })
 
-            if tp is not None and hi >= tp:
+            # optional far TP (rare if trailing/partial works)
+            if tp is not None and TP_ATR and TP_ATR > 0 and hi >= tp:
                 rem = 1.0 - (PARTIAL_FRACTION if partial_done else 0.0)
                 if rem > 0:
                     trades.append({
@@ -514,8 +527,13 @@ def simulate_portfolio_daily(trades: pd.DataFrame,
     sector_reject = 0
     open_attempts = 0
     opened = 0
+    opened_by_day = 0
+    skip_same_ticker = 0
+    skip_day_limit = 0
+    sized_boosted = 0
 
     for d in cal:
+        opened_by_day = 0
         d_utc = as_utc(pd.Timestamp(d))
         eq = compute_equity(d)
 
@@ -570,14 +588,18 @@ def simulate_portfolio_daily(trades: pd.DataFrame,
             if mstate in ALLOW_ENTRY_STATES:
                 batch = entries_by_day[pd.Timestamp(d)].copy()
 
-                # ALWAYS create rs column (FIX)
+                # one open per ticker per day
+                if ONE_OPEN_PER_TICKER_PER_DAY and not batch.empty:
+                    batch = batch.sort_values("score", ascending=False)
+                    batch = batch.drop_duplicates(subset=["ticker"], keep="first")
+
+                # ALWAYS create rs col
                 batch["rs"] = np.nan
 
                 # RS filter for day if available
                 if (not rs_table.empty) and (pd.Timestamp(d) in rs_table.index):
                     rs_row = rs_table.loc[pd.Timestamp(d)]
                     rs_thr = float(rs_row.get("rs_threshold", np.nan))
-                    # map per ticker rs
                     batch["rs"] = batch["ticker"].map(lambda x: float(rs_row.get(x, np.nan)))
                     if not np.isnan(rs_thr):
                         pre_n = len(batch)
@@ -594,20 +616,35 @@ def simulate_portfolio_daily(trades: pd.DataFrame,
                 if batch.empty:
                     continue
 
+                # score sizing threshold inside the day (mild)
+                if SCORE_SIZING_ENABLE:
+                    thr = batch["score"].quantile(SCORE_SIZING_TOP_Q) if len(batch) > 1 else batch["score"].iloc[0]
+                    batch["size_mult"] = np.where(batch["score"] >= thr, SCORE_SIZING_MULT, 1.0)
+                else:
+                    batch["size_mult"] = 1.0
+
                 current_equity = compute_equity(d)
                 free_slots = eff_max_positions - len(positions)
                 if free_slots > 0 and current_equity > 0:
-                    # SAFE SORT (FIX)
-                    sort_cols = ["score"]
-                    if "rs" in batch.columns:
-                        sort_cols.append("rs")
-                    batch = batch.sort_values(sort_cols, ascending=False)
+                    batch = batch.sort_values(["score","rs"], ascending=False)
 
                     prices = close_pivot.loc[d]
+                    opened_tickers_today = set()
+
                     for _, r in batch.iterrows():
                         open_attempts += 1
+
+                        if opened_by_day >= MAX_OPENS_PER_DAY:
+                            skip_day_limit += 1
+                            break
+
                         if free_slots <= 0:
                             break
+
+                        tkr = r["ticker"]
+                        if ONE_OPEN_PER_TICKER_PER_DAY and tkr in opened_tickers_today:
+                            skip_same_ticker += 1
+                            continue
 
                         current_equity = compute_equity(d)
                         current_util = used_util(current_equity)
@@ -622,7 +659,7 @@ def simulate_portfolio_daily(trades: pd.DataFrame,
                         if pos_frac > free_util:
                             continue
 
-                        px = prices.get(r["ticker"], np.nan)
+                        px = prices.get(tkr, np.nan)
                         if pd.isna(px):
                             continue
 
@@ -631,10 +668,15 @@ def simulate_portfolio_daily(trades: pd.DataFrame,
                         cash -= notional
 
                         tid = int(r["trade_id"])
-                        positions[tid] = {"ticker": r["ticker"], "entry_px": float(entry_adj), "notional": float(notional)}
-                        events.append((d_utc, "OPEN", r["ticker"], tid,
-                                       f"mscore={mscore:.2f},scale={scale:.2f},rs={float(r.get('rs',np.nan)):.3f}"))
+                        positions[tid] = {"ticker": tkr, "entry_px": float(entry_adj), "notional": float(notional)}
+                        if size_mult > 1.0:
+                            sized_boosted += 1
                         opened += 1
+                        opened_by_day += 1
+                        opened_tickers_today.add(tkr)
+
+                        events.append((d_utc, "OPEN", tkr, tid,
+                                       f"mscore={mscore:.2f},scale={scale:.2f},rs={float(r.get('rs',np.nan)):.3f},size_mult={size_mult:.2f}"))
                         free_slots -= 1
 
         equity_curve.append((d_utc, compute_equity(d)))
@@ -647,6 +689,9 @@ def simulate_portfolio_daily(trades: pd.DataFrame,
         "sector_reject": int(sector_reject),
         "open_attempts": int(open_attempts),
         "opened": int(opened),
+        "skip_same_ticker": int(skip_same_ticker),
+        "skip_day_limit": int(skip_day_limit),
+        "sized_boosted": int(sized_boosted),
     }
     return equity_df, events_df, debug
 
@@ -699,16 +744,36 @@ def main():
         "DYNEXP_ENABLE": os.getenv("DYNEXP_ENABLE"),
         "SCORE_MIN_EXPO": os.getenv("SCORE_MIN_EXPO"),
         "SCORE_MAX_EXPO": os.getenv("SCORE_MAX_EXPO"),
-        "SECTOR_ENABLE": os.getenv("SECTOR_ENABLE"),
-        "SECTOR_MAP_KEY": os.getenv("SECTOR_MAP_KEY"),
+        "ENABLE_PARTIAL_TP": os.getenv("ENABLE_PARTIAL_TP"),
+        "PARTIAL_TP_R": os.getenv("PARTIAL_TP_R"),
+        "PARTIAL_FRACTION": os.getenv("PARTIAL_FRACTION"),
+        "TRAIL_ATR_MULT": os.getenv("TRAIL_ATR_MULT"),
+        "SCORE_SIZING_ENABLE": os.getenv("SCORE_SIZING_ENABLE"),
+        "SCORE_SIZING_TOP_Q": os.getenv("SCORE_SIZING_TOP_Q"),
+        "SCORE_SIZING_MULT": os.getenv("SCORE_SIZING_MULT"),
+        "MAX_OPENS_PER_DAY": os.getenv("MAX_OPENS_PER_DAY"),
     }
 
     stats = {
-        "mode": "POOS DAILY v3.1 FIX (RS top + dyn exposure) " + ("+SECTOR" if sector_loaded else ""),
+        "mode": "POOS DAILY v3.2 MODERATE (partial TP + mild score sizing + RS + dyn exp)",
         "tickers_tested": int(len(tickers)),
         "raw_trades": int(len(trades)) if not trades.empty else 0,
         "final_equity": float(equity_df["equity"].iloc[-1]) if not equity_df.empty else 1.0,
         "sim_debug": sim_debug,
+        "setup_params": {
+            "enable_partial_tp": bool(ENABLE_PARTIAL_TP),
+            "partial_tp_r": float(PARTIAL_TP_R),
+            "partial_fraction": float(PARTIAL_FRACTION),
+            "trail_mode": str(TRAIL_MODE),
+            "trail_atr_mult": float(TRAIL_ATR_MULT),
+            "score_sizing_enable": bool(SCORE_SIZING_ENABLE),
+            "score_sizing_top_q": float(SCORE_SIZING_TOP_Q),
+            "score_sizing_mult": float(SCORE_SIZING_MULT),
+            "max_opens_per_day": int(MAX_OPENS_PER_DAY),
+            "rs_win1": int(RS_WIN1),
+            "rs_win2": int(RS_WIN2),
+            "rs_top_q": float(RS_TOP_Q),
+        },
         "env_debug": env_debug,
     }
 
@@ -716,7 +781,6 @@ def main():
     put_text(f"{RESULT_PREFIX}/trades.csv", trades.to_csv(index=False) if not trades.empty else "ticker,entry_time,exit_time,entry,exit,exit_reason,hold_days,be_moved,score,entry_market_state,size_mult\n")
     put_text(f"{RESULT_PREFIX}/equity.csv", equity_df.to_csv(index=False) if not equity_df.empty else "date,equity\n")
     put_text(f"{RESULT_PREFIX}/events.csv", events_df.to_csv(index=False) if not events_df.empty else "time,event,ticker,trade_id,reason\n")
-    put_text(f"{RESULT_PREFIX}/market_score.csv", ms.to_csv(index=False))
     if not diag_df.empty:
         put_text(f"{RESULT_PREFIX}/diag.csv", diag_df.to_csv(index=False))
 
@@ -724,7 +788,7 @@ def main():
     if not equity_df.empty:
         plt.plot(pd.to_datetime(equity_df["date"]), equity_df["equity"])
         plt.xticks(rotation=30, ha="right")
-        plt.title("POOS Daily Equity (RS top + dyn exposure)")
+        plt.title("POOS Daily Equity (v3.2 moderate)")
         plt.tight_layout()
     else:
         plt.text(0.5, 0.5, "No trades", ha="center", va="center")
